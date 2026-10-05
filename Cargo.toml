@@ -1,0 +1,14 @@
+[package]
+name = "quarry"
+version = "0.1.0"
+edition = "2021"
+description = "A vectorized SQL query engine written from scratch"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "quarry"
+path = "src/main.rs"
+
+[dependencies]
