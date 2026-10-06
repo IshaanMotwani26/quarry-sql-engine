@@ -4,19 +4,30 @@ A vectorized SQL query engine written from scratch in Rust, with no dependencies
 
 ```
 SQL text → lexer → parser → AST → binder → logical plan → optimizer → physical plan → vectorized execution
-           └──────── done ────────┘
+           └──────────────── done ────────────────┘
 ```
 
 ## Quick start
 
 ```bash
-cargo test            # 24 tests, including TPC-H round trips and 20k random-AST property cases
-cargo run             # REPL: echoes canonical SQL; \ast toggles the syntax tree, \q quits
+cargo test            # 57 tests: parser, binder, storage, TPC-H, property tests
+cargo run             # REPL; \? lists commands
 ```
 
 ```
-quarry> select A+b*2 as total from T where x between 1 and 5 and not exists (select 1 from z);
-SELECT a + b * 2 AS total FROM t WHERE x BETWEEN 1 AND 5 AND NOT EXISTS (SELECT 1 FROM z)
+quarry> \tpch
+registered 8 TPC-H tables (no rows)
+quarry> \plan
+quarry> select c_name from customer where not exists (select * from orders where o_custkey = c_custkey);
+columns: c_name VARCHAR
+Query
+  scan customer
+  filter: NOT EXISTS $sub0
+    $sub0:
+      Query (correlated on customer.c_custkey)
+        scan orders
+        filter: (orders.o_custkey = customer.c_custkey)
+        ...
 ```
 
 ## Phase 1: SQL front end (complete)
@@ -27,10 +38,19 @@ SELECT a + b * 2 AS total FROM t WHERE x BETWEEN 1 AND 5 AND NOT EXISTS (SELECT 
 
 **How it's tested:** a property test generates random syntax trees, prints them, reparses them, and asserts the result is identical. On its first run it found a real precedence bug: `NOT EXISTS (q) IN (...)` must mean `NOT (EXISTS (q) IN (...))`. The suite also includes TPC-H queries 1, 3, 6, 8, 13, and 22.
 
+## Phase 2: Catalog and binder (complete)
+
+- **Storage** (`src/catalog.rs`): columnar in-memory tables, with one typed vector per column and atomic row inserts.
+- **CSV loader** (`src/csv.rs`): hand-written RFC 4180 parser with type inference. It distinguishes NULL from an empty string and reads TPC-H `.tbl` files, reporting errors by line and column.
+- **Binder** (`src/binder.rs`): resolves every name to a unique column id, including self-joins, derived tables with column aliases, and correlated subqueries. It type-checks expressions and inserts implicit casts. It enforces SQL's aggregation rules: no aggregates in WHERE, no nested aggregates, and every output either grouped or aggregated. It also resolves ORDER BY by alias, position, or hidden column. Error messages follow Postgres wording.
+- **Dates** (`src/types.rs`): Gregorian calendar math with no dependencies, verified by round-tripping every day from 1800 to 2200.
+
+All six TPC-H queries in `src/tpch.rs` bind with the correct output schemas.
+
 ## Roadmap
 
 - [x] **1. Front end**: lexer, parser, AST, canonical printer
-- [ ] **2. Catalog + binder**: schemas, name resolution, type checking, CSV loading
+- [x] **2. Catalog + binder**: schemas, name resolution, type checking, CSV loading
 - [ ] **3. Logical plan + Volcano executor**: scan, filter, project, nested-loop join, sort, limit (first end-to-end queries)
 - [ ] **4. Aggregation + hash join**: GROUP BY and hash join; run TPC-H Q1, Q3, Q6
 - [ ] **5. Optimizer**: predicate pushdown, projection pruning, constant folding, join reordering
