@@ -4,13 +4,13 @@ A vectorized SQL query engine written from scratch in Rust, with no dependencies
 
 ```
 SQL text → lexer → parser → AST → binder → logical plan → optimizer → physical plan → vectorized execution
-           └──────────────── done ────────────────┘
+           └───────────────────── done ─────────────────────┘
 ```
 
 ## Quick start
 
 ```bash
-cargo test            # 57 tests: parser, binder, storage, TPC-H, property tests
+cargo test            # 82 tests: parser, binder, planner, evaluator, storage, TPC-H
 cargo run             # REPL; \? lists commands
 ```
 
@@ -47,11 +47,16 @@ Query
 
 All six TPC-H queries in `src/tpch.rs` bind with the correct output schemas.
 
+## Phase 3a: Logical planner and expression evaluator (complete)
+
+- **Planner** (`src/plan.rs`): turns a bound query into a tree of relational operators (Scan, Filter, Join, Aggregate, Project, Distinct, Sort, Limit) in SQL's logical evaluation order. Operators refer to columns only by id. `\explain` in the REPL prints the plan, including plans for subqueries.
+- **Evaluator** (`src/eval.rs`): computes any expression against a row with Postgres semantics. That covers three-valued logic, the NULL behavior of `IN`/`NOT IN`, overflow and division-by-zero errors, month arithmetic that clamps to the end of the month, `LIKE` with escapes, and casts. Correlated column references resolve through a chain of enclosing-row scopes.
+
 ## Roadmap
 
 - [x] **1. Front end**: lexer, parser, AST, canonical printer
 - [x] **2. Catalog + binder**: schemas, name resolution, type checking, CSV loading
-- [ ] **3. Logical plan + Volcano executor**: scan, filter, project, nested-loop join, sort, limit (first end-to-end queries)
+- [ ] **3. Logical plan + Volcano executor** (3a planner + evaluator done): scan, filter, project, nested-loop join, sort, limit (first end-to-end queries)
 - [ ] **4. Aggregation + hash join**: GROUP BY and hash join; run TPC-H Q1, Q3, Q6
 - [ ] **5. Optimizer**: predicate pushdown, projection pruning, constant folding, join reordering
 - [ ] **6. Vectorized execution**: columnar batches; benchmark against the Volcano baseline

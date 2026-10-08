@@ -997,7 +997,7 @@ fn bind_literal(l: &Literal) -> Result<BoundExpr> {
                     .map(Value::Float64)
                     .map_err(|_| BindError(format!("invalid number {n}")))
             };
-            if n.contains(|c| matches!(c, '.' | 'e' | 'E')) {
+            if n.contains(['.', 'e', 'E']) {
                 float()?
             } else {
                 // Integers too large for BIGINT become DOUBLE rather than failing.

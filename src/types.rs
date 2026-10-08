@@ -116,11 +116,11 @@ impl fmt::Display for Value {
 // Conversions use Howard Hinnant's civil-date algorithms (no dependencies).
 // ---------------------------------------------------------------------------
 
-fn is_leap(y: i64) -> bool {
+pub fn is_leap(y: i64) -> bool {
     y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
 }
 
-fn days_in_month(y: i64, m: u32) -> u32 {
+pub fn days_in_month(y: i64, m: u32) -> u32 {
     match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,

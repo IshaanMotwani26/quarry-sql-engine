@@ -452,7 +452,7 @@ impl<'a> Explainer<'a> {
         for a in &q.aggregates {
             let mut subs = Vec::new();
             let arg = match &a.arg {
-                Some(e) => self.expr(e, &mut subs),
+                Some(e) => fmt_expr(self.cols, e, &mut subs),
                 None => "*".into(),
             };
             let distinct = if a.distinct { "DISTINCT " } else { "" };
@@ -542,7 +542,7 @@ impl<'a> Explainer<'a> {
 
     fn expr_line(&mut self, indent: usize, label: &str, e: &'a BoundExpr) {
         let mut subs = Vec::new();
-        let text = self.expr(e, &mut subs);
+        let text = fmt_expr(self.cols, e, &mut subs);
         self.line(indent, &format!("{label} {text}"));
         self.subqueries(subs, indent);
     }
@@ -553,89 +553,99 @@ impl<'a> Explainer<'a> {
             self.query(s, indent + 2);
         }
     }
+}
 
-    fn expr(&self, e: &'a BoundExpr, subs: &mut Vec<&'a BoundQuery>) -> String {
-        let not = |n: bool| if n { "NOT " } else { "" };
-        match &e.kind {
-            ExprKind::Column(id) => self.name(*id),
-            ExprKind::Literal(v) => match v {
-                Value::Utf8(s) => format!("'{}'", s.replace('\'', "''")),
-                Value::Date(_) => format!("DATE '{v}'"),
-                Value::Interval { .. } => format!("INTERVAL '{v}'"),
-                Value::Null => format!("NULL::{}", e.ty),
-                _ => v.to_string(),
-            },
-            ExprKind::Unary {
-                op: UnaryOp::Not,
-                expr,
-            } => format!("NOT {}", self.expr(expr, subs)),
-            ExprKind::Unary { expr, .. } => format!("-{}", self.expr(expr, subs)),
-            ExprKind::Binary { left, op, right } => {
-                format!(
-                    "({} {op} {})",
-                    self.expr(left, subs),
-                    self.expr(right, subs)
-                )
+/// Formats a bound expression as readable SQL-like text. Subqueries are
+/// replaced by `$subN` tags and appended to `subs` so callers can print them.
+pub fn fmt_expr<'a>(
+    cols: &[ColumnInfo],
+    e: &'a BoundExpr,
+    subs: &mut Vec<&'a BoundQuery>,
+) -> String {
+    let not = |n: bool| if n { "NOT " } else { "" };
+    match &e.kind {
+        ExprKind::Column(id) => cols[*id].display_name(),
+        ExprKind::Literal(v) => match v {
+            Value::Utf8(s) => format!("'{}'", s.replace('\'', "''")),
+            Value::Date(_) => format!("DATE '{v}'"),
+            Value::Interval { .. } => format!("INTERVAL '{v}'"),
+            Value::Null => format!("NULL::{}", e.ty),
+            _ => v.to_string(),
+        },
+        ExprKind::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => format!("NOT {}", fmt_expr(cols, expr, subs)),
+        ExprKind::Unary { expr, .. } => format!("-{}", fmt_expr(cols, expr, subs)),
+        ExprKind::Binary { left, op, right } => {
+            format!(
+                "({} {op} {})",
+                fmt_expr(cols, left, subs),
+                fmt_expr(cols, right, subs)
+            )
+        }
+        ExprKind::IsNull { expr, negated } => {
+            format!("{} IS {}NULL", fmt_expr(cols, expr, subs), not(*negated))
+        }
+        ExprKind::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            format!(
+                "{} {}LIKE {}",
+                fmt_expr(cols, expr, subs),
+                not(*negated),
+                fmt_expr(cols, pattern, subs)
+            )
+        }
+        ExprKind::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let items: Vec<String> = list.iter().map(|x| fmt_expr(cols, x, subs)).collect();
+            format!(
+                "{} {}IN ({})",
+                fmt_expr(cols, expr, subs),
+                not(*negated),
+                items.join(", ")
+            )
+        }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_result,
+        } => {
+            let mut s = String::from("CASE");
+            if let Some(o) = operand {
+                s += &format!(" {}", fmt_expr(cols, o, subs));
             }
-            ExprKind::IsNull { expr, negated } => {
-                format!("{} IS {}NULL", self.expr(expr, subs), not(*negated))
+            for (w, t) in branches {
+                s += &format!(
+                    " WHEN {} THEN {}",
+                    fmt_expr(cols, w, subs),
+                    fmt_expr(cols, t, subs)
+                );
             }
-            ExprKind::Like {
-                expr,
-                pattern,
-                negated,
-            } => {
-                format!(
-                    "{} {}LIKE {}",
-                    self.expr(expr, subs),
-                    not(*negated),
-                    self.expr(pattern, subs)
-                )
+            if let Some(x) = else_result {
+                s += &format!(" ELSE {}", fmt_expr(cols, x, subs));
             }
-            ExprKind::InList {
-                expr,
-                list,
-                negated,
-            } => {
-                let items: Vec<String> = list.iter().map(|x| self.expr(x, subs)).collect();
-                format!(
-                    "{} {}IN ({})",
-                    self.expr(expr, subs),
-                    not(*negated),
-                    items.join(", ")
-                )
-            }
-            ExprKind::Case {
-                operand,
-                branches,
-                else_result,
-            } => {
-                let mut s = String::from("CASE");
-                if let Some(o) = operand {
-                    s += &format!(" {}", self.expr(o, subs));
-                }
-                for (w, t) in branches {
-                    s += &format!(" WHEN {} THEN {}", self.expr(w, subs), self.expr(t, subs));
-                }
-                if let Some(x) = else_result {
-                    s += &format!(" ELSE {}", self.expr(x, subs));
-                }
-                s + " END"
-            }
-            ExprKind::Cast { expr } => format!("CAST({} AS {})", self.expr(expr, subs), e.ty),
-            ExprKind::Function { func, args } => {
-                let args: Vec<String> = args.iter().map(|a| self.expr(a, subs)).collect();
-                format!("{}({})", func.name(), args.join(", "))
-            }
-            ExprKind::Subquery { query, kind } => {
-                let tag = format!("$sub{}", subs.len());
-                subs.push(query);
-                match kind {
-                    SubqueryKind::Scalar => tag,
-                    SubqueryKind::Exists { negated } => format!("{}EXISTS {tag}", not(*negated)),
-                    SubqueryKind::In { expr, negated } => {
-                        format!("{} {}IN {tag}", self.expr(expr, subs), not(*negated))
-                    }
+            s + " END"
+        }
+        ExprKind::Cast { expr } => format!("CAST({} AS {})", fmt_expr(cols, expr, subs), e.ty),
+        ExprKind::Function { func, args } => {
+            let args: Vec<String> = args.iter().map(|a| fmt_expr(cols, a, subs)).collect();
+            format!("{}({})", func.name(), args.join(", "))
+        }
+        ExprKind::Subquery { query, kind } => {
+            let tag = format!("$sub{}", subs.len());
+            subs.push(query);
+            match kind {
+                SubqueryKind::Scalar => tag,
+                SubqueryKind::Exists { negated } => format!("{}EXISTS {tag}", not(*negated)),
+                SubqueryKind::In { expr, negated } => {
+                    format!("{} {}IN {tag}", fmt_expr(cols, expr, subs), not(*negated))
                 }
             }
         }

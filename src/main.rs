@@ -1,5 +1,5 @@
-//! Quarry REPL. Parses and binds SQL against an in-memory catalog; execution
-//! arrives in Phase 3.
+//! Quarry REPL. Parses, binds, and plans SQL against an in-memory catalog;
+//! execution arrives in Phase 3b.
 //!
 //!   quarry> \tpch
 //!   quarry> select l_returnflag, count(*) from lineitem group by l_returnflag;
@@ -11,7 +11,7 @@ use std::path::Path;
 use quarry::ast::Statement;
 use quarry::catalog::Catalog;
 use quarry::csv::{read_csv_file, CsvOptions};
-use quarry::{bind, parse_statements, tpch, ParseError};
+use quarry::{bind, parse_statements, plan_query, tpch, ParseError};
 
 const HELP: &str = "\
   \\load <table> <file> [delim]   load a CSV with a header row (types are inferred)
@@ -20,12 +20,14 @@ const HELP: &str = "\
   \\d [table]                     list tables, or describe one
   \\ast                           toggle printing the parsed syntax tree
   \\plan                          toggle printing the bound query
+  \\explain                       toggle printing the logical plan
   \\q                             quit";
 
 struct Session {
     catalog: Catalog,
     show_ast: bool,
     show_plan: bool,
+    show_explain: bool,
 }
 
 fn main() {
@@ -34,6 +36,7 @@ fn main() {
         catalog: Catalog::new(),
         show_ast: false,
         show_plan: false,
+        show_explain: false,
     };
     let mut buffer = String::new();
 
@@ -106,6 +109,13 @@ impl Session {
                 println!(
                     "bound query output {}",
                     if self.show_plan { "on" } else { "off" }
+                );
+            }
+            ["\\explain"] => {
+                self.show_explain = !self.show_explain;
+                println!(
+                    "logical plan output {}",
+                    if self.show_explain { "on" } else { "off" }
                 );
             }
             ["\\tpch"] => {
@@ -189,6 +199,9 @@ impl Session {
                     println!("columns: {}", cols.join(", "));
                     if self.show_plan {
                         print!("{}", bound.explain());
+                    }
+                    if self.show_explain {
+                        print!("{}", plan_query(&bound.query).explain(&bound.columns));
                     }
                 }
                 Err(e) => eprintln!("error: {e}"),
