@@ -3,31 +3,31 @@
 A vectorized SQL query engine written from scratch in Rust, with no dependencies.
 
 ```
-SQL text → lexer → parser → AST → binder → logical plan → optimizer → physical plan → vectorized execution
-           └───────────────────── done ─────────────────────┘
+SQL text → lexer → parser → AST → binder → logical plan → executor → optimizer → vectorized execution
+           └──────────────────────── done ─────────────────────────┘
 ```
 
 ## Quick start
 
 ```bash
-cargo test            # 82 tests: parser, binder, planner, evaluator, storage, TPC-H
-cargo run             # REPL; \? lists commands
+cargo test            # 105 tests: parser, binder, planner, evaluator, executor, storage, TPC-H
+cargo run             # REPL; \? lists commands, \demo loads sample tables
 ```
 
 ```
-quarry> \tpch
-registered 8 TPC-H tables (no rows)
-quarry> \plan
-quarry> select c_name from customer where not exists (select * from orders where o_custkey = c_custkey);
-columns: c_name VARCHAR
-Query
-  scan customer
-  filter: NOT EXISTS $sub0
-    $sub0:
-      Query (correlated on customer.c_custkey)
-        scan orders
-        filter: (orders.o_custkey = customer.c_custkey)
-        ...
+quarry> \demo
+quarry> select e.name, m.name as manager from emp e left join emp m on e.manager_id = m.id order by e.name limit 3;
+  name   | manager
+---------+---------
+ Ada     | NULL
+ Barbara | Ken
+ Edsger  | NULL
+(3 rows)
+quarry> select name from dept d where not exists (select 1 from emp e where e.dept_id = d.id);
+ name
+-------
+ Legal
+(1 row)
 ```
 
 ## Phase 1: SQL front end (complete)
@@ -52,13 +52,21 @@ All six TPC-H queries in `src/tpch.rs` bind with the correct output schemas.
 - **Planner** (`src/plan.rs`): turns a bound query into a tree of relational operators (Scan, Filter, Join, Aggregate, Project, Distinct, Sort, Limit) in SQL's logical evaluation order. Operators refer to columns only by id. `\explain` in the REPL prints the plan, including plans for subqueries.
 - **Evaluator** (`src/eval.rs`): computes any expression against a row with Postgres semantics. That covers three-valued logic, the NULL behavior of `IN`/`NOT IN`, overflow and division-by-zero errors, month arithmetic that clamps to the end of the month, `LIKE` with escapes, and casts. Correlated column references resolve through a chain of enclosing-row scopes.
 
+## Phase 3b: Volcano executor (complete)
+
+- **Executor** (`src/exec.rs`): pull-based operators (Scan, Filter, Project, nested-loop Join, Distinct, Sort, Limit). Each operator resolves column ids to row positions once, when it's built. The join handles INNER, LEFT, RIGHT, FULL, and CROSS. Sort is stable and honors `NULLS FIRST/LAST`. Limit stops pulling from its input once it has enough rows.
+- **Subqueries**: uncorrelated subqueries run once and their results are cached. Correlated ones re-run for each outer row, with that row in scope, including references two or more levels out.
+- **Tests**: besides hand-checked queries, a property test compares every join kind against a brute-force reference on 300 random table pairs with duplicate and NULL keys. Deliberately breaking FULL JOIN makes it fail.
+
+Aggregation is planned but not executed yet; that's Phase 4a.
+
 ## Roadmap
 
 - [x] **1. Front end**: lexer, parser, AST, canonical printer
 - [x] **2. Catalog + binder**: schemas, name resolution, type checking, CSV loading
-- [ ] **3. Logical plan + Volcano executor** (3a planner + evaluator done): scan, filter, project, nested-loop join, sort, limit (first end-to-end queries)
-- [ ] **4. Aggregation + hash join**: GROUP BY and hash join; run TPC-H Q1, Q3, Q6
-- [ ] **5. Optimizer**: predicate pushdown, projection pruning, constant folding, join reordering
-- [ ] **6. Vectorized execution**: columnar batches; benchmark against the Volcano baseline
-- [ ] **7. Parquet + Postgres wire protocol**: connect with `psql` and psycopg
-- [ ] **8. Evaluation**: TPC-H SF1 benchmarks vs SQLite/DuckDB; differential testing against DuckDB
+- [x] **3. Planner + executor**: 3a logical planner and expression evaluator; 3b Volcano executor (first end-to-end queries)
+- [ ] **4. Aggregation + hash join**: 4a hash aggregation; 4b hash join; run TPC-H Q1, Q3, Q6
+- [ ] **5. Optimizer**: 5a predicate pushdown, projection pruning, constant folding; 5b join reordering, subquery decorrelation
+- [ ] **6. Vectorized execution**: 6a columnar batches and vectorized expressions; 6b vectorized operators, benchmarked against the Volcano baseline
+- [ ] **7. Interop**: 7a Parquet reader; 7b Postgres wire protocol (connect with `psql` and psycopg)
+- [ ] **8. Evaluation**: 8a TPC-H SF1 benchmarks vs SQLite/DuckDB; 8b differential testing against DuckDB
