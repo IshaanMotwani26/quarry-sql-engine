@@ -319,9 +319,10 @@ fn runtime_errors_surface() {
         try_query(&c, "SELECT salary / (id - 1) FROM emp").unwrap_err(),
         "division by zero"
     );
-    assert!(try_query(&c, "SELECT count(*) FROM emp")
-        .unwrap_err()
-        .contains("aggregation"));
+    assert_eq!(
+        try_query(&c, "SELECT (SELECT name FROM dept)").unwrap_err(),
+        "more than one row returned by a subquery used as an expression"
+    );
 }
 
 #[test]

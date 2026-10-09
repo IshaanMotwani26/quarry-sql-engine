@@ -7,8 +7,9 @@
 //!
 //! Each operator maps column ids to row positions once, when it is built
 //! (`Layout`), so evaluating `orders.o_custkey` at runtime is a hash lookup
-//! instead of a name search. Sort is the only blocking operator here (it must
-//! see every row before emitting one); a join materializes its right input.
+//! instead of a name search. Sort and HashAggregate are blocking (they must
+//! see every input row before emitting one); a join materializes its right
+//! input.
 //!
 //! Subqueries run through the same machinery. An uncorrelated subquery runs
 //! once and its rows are cached. A correlated one re-runs for each outer row
@@ -20,8 +21,9 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use crate::agg::{AggState, KeyValue};
 use crate::ast::JoinKind;
-use crate::bound::{Bound, BoundExpr, BoundQuery, ColumnId};
+use crate::bound::{AggregateCall, Bound, BoundExpr, BoundQuery, ColumnId, GroupKey};
 use crate::catalog::{Catalog, Field, Table};
 use crate::eval::{
     compare, eval, eval_predicate, ExecError, Layout, Result, Row, Scope, SubqueryRunner,
@@ -144,11 +146,17 @@ impl<'c> Executor<'c> {
                     tail: 0,
                 })
             }
-            Plan::Aggregate { .. } => {
-                return Err(ExecError(
-                    "aggregation (GROUP BY, count, sum, ...) is not supported yet".into(),
-                ));
-            }
+            Plan::Aggregate {
+                input,
+                group_by,
+                aggregates,
+            } => Box::new(HashAggregate {
+                layout: Layout::new(&input.output()),
+                input: Some(self.build(input)?),
+                group_by,
+                aggregates,
+                output: Vec::new().into_iter(),
+            }),
             Plan::Distinct { input } => Box::new(Distinct {
                 input: self.build(input)?,
                 seen: HashSet::new(),
@@ -369,40 +377,77 @@ impl Operator for NestedLoopJoin<'_> {
     }
 }
 
-/// A hashable stand-in for `Value`. Floats hash by bit pattern after
-/// normalizing -0.0 to 0.0 and every NaN to one NaN, so values that compare
-/// equal also hash equal.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum KeyValue {
-    Null,
-    Boolean(bool),
-    Int64(i64),
-    Float64(u64),
-    Utf8(String),
-    Date(i32),
-    Interval(i32, i32),
+/// Hash aggregation. Reads its whole input, assigning each row to a group
+/// by its GROUP BY key values, then emits one row per group: the key values
+/// followed by each aggregate's result.
+///
+/// Groups are emitted in the order their first row arrived, so output is
+/// deterministic without an ORDER BY. With no GROUP BY there is exactly one
+/// group, even over zero input rows (`SELECT count(*) FROM empty` is 0, not
+/// no rows); with GROUP BY, empty input produces no groups.
+struct HashAggregate<'p> {
+    input: Option<Box<dyn Operator + 'p>>,
+    layout: Layout,
+    group_by: &'p [GroupKey],
+    aggregates: &'p [AggregateCall],
+    output: std::vec::IntoIter<Row>,
 }
 
-impl KeyValue {
-    pub fn of(v: &Value) -> KeyValue {
-        match v {
-            Value::Null => KeyValue::Null,
-            Value::Boolean(b) => KeyValue::Boolean(*b),
-            Value::Int64(x) => KeyValue::Int64(*x),
-            Value::Float64(x) => {
-                let x = if *x == 0.0 {
-                    0.0
-                } else if x.is_nan() {
-                    f64::NAN
-                } else {
-                    *x
-                };
-                KeyValue::Float64(x.to_bits())
+impl HashAggregate<'_> {
+    fn new_states(&self) -> Vec<AggState> {
+        self.aggregates.iter().map(AggState::new).collect()
+    }
+
+    fn consume(
+        &self,
+        mut input: Box<dyn Operator + '_>,
+        exec: &Executor<'_>,
+        outer: Option<&Scope<'_>>,
+    ) -> Result<Vec<Row>> {
+        let mut index: HashMap<Vec<KeyValue>, usize> = HashMap::new();
+        let mut groups: Vec<(Row, Vec<AggState>)> = Vec::new();
+        while let Some(row) = input.next(exec, outer)? {
+            let scope = Scope::new(&self.layout, &row, outer);
+            let mut key = Vec::with_capacity(self.group_by.len());
+            for k in self.group_by {
+                key.push(eval(&k.expr, &scope, exec)?);
             }
-            Value::Utf8(s) => KeyValue::Utf8(s.clone()),
-            Value::Date(d) => KeyValue::Date(*d),
-            Value::Interval { months, days } => KeyValue::Interval(*months, *days),
+            let hashed: Vec<KeyValue> = key.iter().map(KeyValue::of).collect();
+            let g = match index.get(&hashed) {
+                Some(&g) => g,
+                None => {
+                    groups.push((key, self.new_states()));
+                    index.insert(hashed, groups.len() - 1);
+                    groups.len() - 1
+                }
+            };
+            for (state, call) in groups[g].1.iter_mut().zip(self.aggregates) {
+                let value = match &call.arg {
+                    Some(arg) => Some(eval(arg, &scope, exec)?),
+                    None => None,
+                };
+                state.update(value)?;
+            }
         }
+        if self.group_by.is_empty() && groups.is_empty() {
+            groups.push((Vec::new(), self.new_states()));
+        }
+        Ok(groups
+            .into_iter()
+            .map(|(mut row, states)| {
+                row.extend(states.into_iter().map(AggState::finish));
+                row
+            })
+            .collect())
+    }
+}
+
+impl Operator for HashAggregate<'_> {
+    fn next(&mut self, exec: &Executor<'_>, outer: Option<&Scope<'_>>) -> Result<Option<Row>> {
+        if let Some(input) = self.input.take() {
+            self.output = self.consume(input, exec, outer)?.into_iter();
+        }
+        Ok(self.output.next())
     }
 }
 

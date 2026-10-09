@@ -4,6 +4,7 @@
 //! **SQL text -> lexer -> parser -> AST -> binder -> logical plan -> row-at-a-time
 //! execution** -> optimizer -> vectorized execution
 
+pub mod agg;
 pub mod ast;
 pub mod binder;
 pub mod bound;
