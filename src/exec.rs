@@ -8,8 +8,9 @@
 //! Each operator maps column ids to row positions once, when it is built
 //! (`Layout`), so evaluating `orders.o_custkey` at runtime is a hash lookup
 //! instead of a name search. Sort and HashAggregate are blocking (they must
-//! see every input row before emitting one); a join materializes its right
-//! input.
+//! see every input row before emitting one); both join operators materialize
+//! their right input. Joins whose condition contains an equality between the
+//! two sides run as hash joins; everything else runs as a nested loop.
 //!
 //! Subqueries run through the same machinery. An uncorrelated subquery runs
 //! once and its rows are cached. A correlated one re-runs for each outer row
@@ -28,7 +29,7 @@ use crate::catalog::{Catalog, Field, Table};
 use crate::eval::{
     compare, eval, eval_predicate, ExecError, Layout, Result, Row, Scope, SubqueryRunner,
 };
-use crate::plan::{plan_query, Plan};
+use crate::plan::{join_keys, plan_query, JoinKeys, Plan};
 use crate::types::Value;
 
 /// A finished query's output.
@@ -40,7 +41,26 @@ pub struct QueryResult {
 
 /// Plans and runs a bound query to completion.
 pub fn execute(catalog: &Catalog, bound: &Bound) -> Result<QueryResult> {
-    let exec = Executor::new(catalog);
+    execute_with(catalog, bound, ExecOptions::default())
+}
+
+/// Knobs for comparing execution strategies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecOptions {
+    /// Use a hash join whenever the join condition has an equality between
+    /// the two sides. When false, every join is a nested loop.
+    pub hash_join: bool,
+}
+
+impl Default for ExecOptions {
+    fn default() -> Self {
+        ExecOptions { hash_join: true }
+    }
+}
+
+/// Like `execute`, with explicit options.
+pub fn execute_with(catalog: &Catalog, bound: &Bound, options: ExecOptions) -> Result<QueryResult> {
+    let exec = Executor::new(catalog, options);
     let rows = exec.run_query(&bound.query, None)?;
     let columns = bound
         .query
@@ -66,14 +86,16 @@ pub fn execute(catalog: &Catalog, bound: &Bound) -> Result<QueryResult> {
 /// `plans`, which is never cleared while the executor exists).
 struct Executor<'c> {
     catalog: &'c Catalog,
+    options: ExecOptions,
     plans: RefCell<HashMap<*const BoundQuery, Rc<Plan>>>,
     results: RefCell<HashMap<*const BoundQuery, Rc<Vec<Row>>>>,
 }
 
 impl<'c> Executor<'c> {
-    fn new(catalog: &'c Catalog) -> Self {
+    fn new(catalog: &'c Catalog, options: ExecOptions) -> Self {
         Executor {
             catalog,
+            options,
             plans: RefCell::default(),
             results: RefCell::default(),
         }
@@ -128,23 +150,52 @@ impl<'c> Executor<'c> {
                 kind,
                 on,
             } => {
-                let (lw, rw) = (left.output().len(), right.output().len());
-                Box::new(NestedLoopJoin {
-                    layout: Layout::new(&plan.output()),
-                    left: self.build(left)?,
-                    right: Some(self.build(right)?),
-                    right_rows: Vec::new(),
-                    right_matched: Vec::new(),
-                    kind: *kind,
-                    on: on.as_ref(),
-                    left_width: lw,
-                    right_width: rw,
-                    current: None,
-                    idx: 0,
-                    matched: false,
-                    left_done: false,
-                    tail: 0,
-                })
+                let (left_ids, right_ids) = (left.output(), right.output());
+                let (lw, rw) = (left_ids.len(), right_ids.len());
+                let split = match on {
+                    Some(on) if self.options.hash_join => {
+                        Some(join_keys(on, &left_ids, &right_ids))
+                    }
+                    _ => None,
+                };
+                match split {
+                    Some(split) if !split.keys.is_empty() => Box::new(HashJoin {
+                        left_layout: Layout::new(&left_ids),
+                        right_layout: Layout::new(&right_ids),
+                        layout: Layout::new(&plan.output()),
+                        left: self.build(left)?,
+                        right: Some(self.build(right)?),
+                        split,
+                        table: HashMap::new(),
+                        right_rows: Vec::new(),
+                        right_matched: Vec::new(),
+                        kind: *kind,
+                        left_width: lw,
+                        right_width: rw,
+                        current: None,
+                        candidates: Vec::new(),
+                        pos: 0,
+                        matched: false,
+                        left_done: false,
+                        tail: 0,
+                    }),
+                    _ => Box::new(NestedLoopJoin {
+                        layout: Layout::new(&plan.output()),
+                        left: self.build(left)?,
+                        right: Some(self.build(right)?),
+                        right_rows: Vec::new(),
+                        right_matched: Vec::new(),
+                        kind: *kind,
+                        on: on.as_ref(),
+                        left_width: lw,
+                        right_width: rw,
+                        current: None,
+                        idx: 0,
+                        matched: false,
+                        left_done: false,
+                        tail: 0,
+                    }),
+                }
             }
             Plan::Aggregate {
                 input,
@@ -368,6 +419,147 @@ impl Operator for NestedLoopJoin<'_> {
             }
 
             // Every right row has been tried against this left row.
+            let mut row = self.current.take().expect("set above");
+            if !self.matched && matches!(self.kind, JoinKind::Left | JoinKind::Full) {
+                row[lw..].fill(Value::Null);
+                return Ok(Some(row));
+            }
+        }
+    }
+}
+
+/// Hash join for conditions with at least one equality between the sides.
+///
+/// Build phase (first call): read the whole right input, evaluate its key
+/// expressions for each row, and index the rows in a hash table keyed by
+/// those values. Probe phase: for each left row, evaluate its keys and look
+/// up the matching right rows directly, instead of comparing against every
+/// right row as the nested-loop join does. Work drops from O(left x right)
+/// to O(left + right + matches).
+///
+/// A NULL key never matches anything (`NULL = NULL` is not TRUE), so rows with
+/// NULL keys are left out of the table but are still tracked for RIGHT/FULL
+/// joins. Any non-equality conditions (the residual) are checked on each key
+/// match. Candidates are visited in build order, so the output is the same
+/// rows in the same order as the nested-loop join produces.
+struct HashJoin<'p> {
+    left: Box<dyn Operator + 'p>,
+    right: Option<Box<dyn Operator + 'p>>,
+    split: JoinKeys<'p>,
+    left_layout: Layout,
+    right_layout: Layout,
+    /// Layout of a combined (left ++ right) row, for the residual.
+    layout: Layout,
+    table: HashMap<Vec<KeyValue>, Vec<usize>>,
+    right_rows: Vec<Row>,
+    right_matched: Vec<bool>,
+    kind: JoinKind,
+    left_width: usize,
+    right_width: usize,
+    current: Option<Row>,
+    candidates: Vec<usize>,
+    pos: usize,
+    matched: bool,
+    left_done: bool,
+    tail: usize,
+}
+
+/// Evaluates join key expressions; `None` if any key is NULL.
+fn eval_keys<'e>(
+    exprs: impl Iterator<Item = &'e BoundExpr>,
+    scope: &Scope<'_>,
+    exec: &Executor<'_>,
+) -> Result<Option<Vec<KeyValue>>> {
+    let mut key = Vec::new();
+    for e in exprs {
+        let v = eval(e, scope, exec)?;
+        if v.is_null() {
+            return Ok(None);
+        }
+        key.push(KeyValue::of(&v));
+    }
+    Ok(Some(key))
+}
+
+impl HashJoin<'_> {
+    fn build_table(
+        &mut self,
+        mut right: Box<dyn Operator + '_>,
+        exec: &Executor<'_>,
+        outer: Option<&Scope<'_>>,
+    ) -> Result<()> {
+        while let Some(row) = right.next(exec, outer)? {
+            let scope = Scope::new(&self.right_layout, &row, outer);
+            if let Some(key) = eval_keys(self.split.keys.iter().map(|(_, r)| *r), &scope, exec)? {
+                self.table
+                    .entry(key)
+                    .or_default()
+                    .push(self.right_rows.len());
+            }
+            self.right_rows.push(row);
+        }
+        self.right_matched = vec![false; self.right_rows.len()];
+        Ok(())
+    }
+}
+
+impl Operator for HashJoin<'_> {
+    fn next(&mut self, exec: &Executor<'_>, outer: Option<&Scope<'_>>) -> Result<Option<Row>> {
+        if let Some(right) = self.right.take() {
+            self.build_table(right, exec, outer)?;
+        }
+        let lw = self.left_width;
+        loop {
+            if self.left_done {
+                if matches!(self.kind, JoinKind::Right | JoinKind::Full) {
+                    while self.tail < self.right_rows.len() {
+                        let i = self.tail;
+                        self.tail += 1;
+                        if !self.right_matched[i] {
+                            let mut row = vec![Value::Null; lw];
+                            row.extend(self.right_rows[i].iter().cloned());
+                            return Ok(Some(row));
+                        }
+                    }
+                }
+                return Ok(None);
+            }
+
+            if self.current.is_none() {
+                let Some(mut row) = self.left.next(exec, outer)? else {
+                    self.left_done = true;
+                    continue;
+                };
+                let scope = Scope::new(&self.left_layout, &row, outer);
+                let key = eval_keys(self.split.keys.iter().map(|(l, _)| *l), &scope, exec)?;
+                self.candidates = key
+                    .and_then(|k| self.table.get(&k).cloned())
+                    .unwrap_or_default();
+                self.pos = 0;
+                self.matched = false;
+                row.resize(lw + self.right_width, Value::Null);
+                self.current = Some(row);
+            }
+
+            let buf = self.current.as_mut().expect("set above");
+            while self.pos < self.candidates.len() {
+                let i = self.candidates[self.pos];
+                self.pos += 1;
+                buf[lw..].clone_from_slice(&self.right_rows[i]);
+                let mut hit = true;
+                for r in &self.split.residual {
+                    if !eval_predicate(r, &Scope::new(&self.layout, buf, outer), exec)? {
+                        hit = false;
+                        break;
+                    }
+                }
+                if hit {
+                    self.matched = true;
+                    self.right_matched[i] = true;
+                    return Ok(Some(buf.clone()));
+                }
+            }
+
             let mut row = self.current.take().expect("set above");
             if !self.matched && matches!(self.kind, JoinKind::Left | JoinKind::Full) {
                 row[lw..].fill(Value::Null);

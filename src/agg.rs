@@ -22,10 +22,10 @@ use crate::eval::{compare, ExecError, Result};
 use crate::types::{Type, Value};
 
 /// A hashable stand-in for `Value`, used for GROUP BY keys, DISTINCT, and
-/// (in Phase 4b) hash-join keys. Floats hash by bit pattern after
-/// normalizing -0.0 to 0.0 and every NaN to one NaN, so values that compare
-/// equal also hash equal. NULLs hash equal to each other, which is what
-/// GROUP BY and DISTINCT need (all NULLs form one group).
+/// hash-join keys. Floats hash by bit pattern after normalizing -0.0 to 0.0
+/// and every NaN to one NaN, so values that compare equal also hash equal.
+/// NULLs hash equal to each other, which is what GROUP BY and DISTINCT need
+/// (all NULLs form one group); hash joins skip NULL keys before hashing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum KeyValue {
     Null,

@@ -1,6 +1,6 @@
 # Quarry
 
-A vectorized SQL query engine written from scratch in Rust, with no dependencies.
+A vectorized SQL query engine written from scratch in Rust, with no dependencies. It runs TPC-H queries on generated data with hash joins and hash aggregation.
 
 ```
 SQL text → lexer → parser → AST → binder → logical plan → executor → optimizer → vectorized execution
@@ -10,8 +10,8 @@ SQL text → lexer → parser → AST → binder → logical plan → executor �
 ## Quick start
 
 ```bash
-cargo test            # 131 tests: parser, binder, planner, evaluator, executor, aggregation, TPC-H
-cargo run             # REPL; \? lists commands, \demo loads sample tables
+cargo test            # 153 tests: parser, binder, planner, evaluator, joins, aggregation, TPC-H
+cargo run --release   # REPL; \? lists commands, \demo loads sample tables
 ```
 
 ```
@@ -31,6 +31,24 @@ quarry> select d.name, count(e.id) as headcount, avg(e.salary) from dept d left 
  Research    |         1 |             160000
  Legal       |         0 |               NULL
 (4 rows)
+quarry> \tpch 0.01
+generated TPC-H at scale 0.01 (59597 lineitem rows) in 0.1 s
+quarry> \explain
+quarry> \q3
+Limit 10
+  Sort revenue DESC NULLS FIRST, o_orderdate ASC NULLS LAST
+    Project l_orderkey, revenue := sum(l_extendedprice * (1 - l_discount)), o_orderdate, o_shippriority
+      Aggregate keys=[lineitem.l_orderkey, orders.o_orderdate, orders.o_shippriority] aggs=[...]
+        Filter (((customer.c_mktsegment = 'BUILDING') AND ...))
+          HashJoin Inner keys=[orders.o_orderkey = lineitem.l_orderkey]
+            HashJoin Inner keys=[customer.c_custkey = orders.o_custkey]
+              Scan customer
+              Scan orders
+            Scan lineitem
+ l_orderkey |      revenue       | o_orderdate | o_shippriority
+------------+--------------------+-------------+----------------
+      13166 |        337532.7514 | 1995-02-14  |              0
+...
 ```
 
 ## Phase 1: SQL front end (complete)
@@ -68,9 +86,27 @@ All six TPC-H queries in `src/tpch.rs` bind with the correct output schemas.
 - **Works with everything before it**: HAVING (with or without GROUP BY, including subqueries), grouping by expressions, aggregates over joins and derived tables, and correlated subqueries that aggregate once per outer row.
 - **Tests**: TPC-H Q1 and Q6 run on 5,000 generated lineitem rows and are checked against a reference implementation written directly in Rust. Injecting bugs into `avg` or NULL handling fails 7 and 5 tests respectively.
 
+## Phase 4b: Hash join and TPC-H data (complete)
+
+- **HashJoin operator** (`src/exec.rs`): builds a hash table on the right input's join keys and probes it with each left row, instead of comparing every pair of rows. It supports INNER, LEFT, RIGHT, and FULL joins, multi-column and expression keys, and non-equality conditions alongside the keys. NULL keys never match. Matches come out in the same order as the nested-loop join's, so the two give bit-identical results.
+- **Join condition placement** (`src/plan.rs`): `FROM a, b WHERE a.x = b.y` is planned as a hash join instead of a cross product plus a filter. WHERE conditions that span both sides of an inner or comma join move into the lowest join that covers them. Conditions are never moved into outer joins, where that would change the result.
+- **TPC-H data generator** (`src/tpch.rs`): `\tpch 0.01` in the REPL generates all eight tables, deterministically, following the spec's sizes, key relationships, and value rules. `\q1` … `\q22` run the queries, and `\hashjoin` switches hash joins off for comparison.
+- **Tests**: all six TPC-H queries return identical results with hash and nested-loop joins. Q3 is checked against a reference implementation, and a randomized test covers every join kind with multi-key conditions and residuals. Breaking NULL-key handling fails 8 tests. The generator's own integrity test found that the spec's partsupp formula repeats suppliers below scale 0.023, which would duplicate primary keys; the generator now handles small scales.
+
+**Q3, hash join vs nested loop** (release build):
+
+| Scale | Lineitem rows | Hash join | Nested loop | Speedup |
+|---|---|---|---|---|
+| 0.001 | 6k | 24 ms | 2.4 s | ~100× |
+| 0.002 | 12k | 43 ms | 10.0 s | ~230× |
+| 0.005 | 30k | 133 ms | 63.3 s | ~475× |
+
+Doubling the data roughly doubles the hash join's time and quadruples the nested loop's.
+
 ## Known limitations
 
 - **DECIMAL is stored as DOUBLE.** TPC-H's prices and discounts are exact decimals. In binary floating point, `0.06 + 0.01` is `0.06999…`, so Q6's `l_discount BETWEEN 0.05 AND 0.07` drops every 7% discount that a real database would keep. An exact decimal type is needed before Phase 8 can validate against the official TPC-H answers.
+- **No optimizer yet.** Single-table filters run after all joins rather than at the scans, Q8's FROM order forces a `part × supplier` cross product, and Q22's correlated `NOT EXISTS` re-runs once per customer. Phase 5 fixes all three.
 - **Tables live in memory only** and disappear when the REPL exits; on-disk storage comes with the Parquet reader (7a).
 
 ## Roadmap
@@ -78,8 +114,8 @@ All six TPC-H queries in `src/tpch.rs` bind with the correct output schemas.
 - [x] **1. Front end**: lexer, parser, AST, canonical printer
 - [x] **2. Catalog + binder**: schemas, name resolution, type checking, CSV loading
 - [x] **3. Planner + executor**: 3a logical planner and expression evaluator; 3b Volcano executor (first end-to-end queries)
-- [ ] **4. Aggregation + hash join**: 4a hash aggregation (done); 4b hash join; run TPC-H Q1, Q3, Q6
-- [ ] **5. Optimizer**: 5a predicate pushdown, projection pruning, constant folding; 5b join reordering, subquery decorrelation
+- [x] **4. Aggregation + hash join**: 4a hash aggregation; 4b hash join and TPC-H data generator
+- [ ] **5. Optimizer**: 5a filter pushdown to scans and through projections/outer joins, projection pruning, constant folding; 5b join reordering, subquery decorrelation
 - [ ] **6. Vectorized execution**: 6a columnar batches and vectorized expressions; 6b vectorized operators, benchmarked against the Volcano baseline
 - [ ] **7. Interop**: 7a Parquet reader; 7b Postgres wire protocol (connect with `psql` and psycopg)
 - [ ] **8. Evaluation**: 8a TPC-H SF1 benchmarks vs SQLite/DuckDB; 8b differential testing against DuckDB

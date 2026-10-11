@@ -11,7 +11,7 @@ use std::time::Instant;
 use quarry::ast::Statement;
 use quarry::catalog::Catalog;
 use quarry::csv::{parse_csv, read_csv_file, CsvOptions};
-use quarry::exec::{execute, QueryResult};
+use quarry::exec::{execute_with, ExecOptions, QueryResult};
 use quarry::types::{Type, Value};
 use quarry::{bind, parse_statements, plan_query, tpch, ParseError};
 
@@ -20,11 +20,14 @@ const HELP: &str = "\
                                  delim: one character, or \\t for tab
   \\demo                          load small sample tables: emp, dept
   \\tpch                          register the 8 TPC-H tables (schemas only, no rows)
+  \\tpch <scale>                  generate TPC-H data, e.g. \\tpch 0.01 (60k lineitem rows)
+  \\q1 .. \\q22                    run a TPC-H query (1, 3, 6, 8, 13, 22)
   \\d [table]                     list tables, or describe one
   \\ast                           toggle printing the parsed syntax tree
   \\plan                          toggle printing the bound query
   \\explain                       toggle printing the logical plan
   \\timing                        toggle printing execution time
+  \\hashjoin                      toggle hash joins (off = nested-loop joins only)
   \\q                             quit";
 
 const DEMO_DEPT: &str = "\
@@ -52,6 +55,7 @@ struct Session {
     show_plan: bool,
     show_explain: bool,
     timing: bool,
+    options: ExecOptions,
 }
 
 fn main() {
@@ -62,6 +66,7 @@ fn main() {
         show_plan: false,
         show_explain: false,
         timing: interactive,
+        options: ExecOptions::default(),
     };
     let mut buffer = String::new();
 
@@ -163,6 +168,31 @@ impl Session {
                 tpch::register_schemas(&mut self.catalog);
                 println!("registered {} TPC-H tables (no rows)", tpch::TABLES.len());
             }
+            ["\\tpch", scale] => match scale.parse::<f64>() {
+                Ok(scale) if scale > 0.0 && scale <= 1.0 => {
+                    let start = Instant::now();
+                    tpch::generate(&mut self.catalog, scale);
+                    let rows = self.catalog.get("lineitem").map_or(0, |t| t.row_count());
+                    println!(
+                        "generated TPC-H at scale {scale} ({rows} lineitem rows) in {:.1} s",
+                        start.elapsed().as_secs_f64()
+                    );
+                }
+                _ => eprintln!("error: scale must be a number in (0, 1], e.g. \\tpch 0.01"),
+            },
+            ["\\hashjoin"] => {
+                self.options.hash_join = !self.options.hash_join;
+                println!("hash joins {}", on_off(self.options.hash_join));
+            }
+            [cmd] if cmd.starts_with("\\q") && cmd[2..].parse::<u32>().is_ok() => {
+                let n: u32 = cmd[2..].parse().expect("checked above");
+                match tpch::QUERIES.iter().find(|(q, _)| *q == n) {
+                    Some((_, sql)) => self.run(sql),
+                    None => {
+                        eprintln!("error: TPC-H Q{n} isn't included yet; try 1, 3, 6, 8, 13, or 22")
+                    }
+                }
+            }
             ["\\d"] => {
                 let mut any = false;
                 for t in self.catalog.tables() {
@@ -243,7 +273,7 @@ impl Session {
                 print!("{}", plan_query(&bound.query).explain(&bound.columns));
             }
             let start = Instant::now();
-            match execute(&self.catalog, &bound) {
+            match execute_with(&self.catalog, &bound, self.options) {
                 Ok(result) => {
                     print!("{}", format_table(&result));
                     if self.timing {

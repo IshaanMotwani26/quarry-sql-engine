@@ -12,12 +12,22 @@
 //! FROM -> WHERE -> GROUP BY/aggregates -> HAVING -> SELECT -> DISTINCT
 //!      -> ORDER BY -> LIMIT/OFFSET -> drop hidden ORDER BY columns
 //! ```
+//!
+//! One rewrite happens during planning: a WHERE condition that compares
+//! columns from both sides of an inner or comma join moves into that join's
+//! condition. `FROM a, b WHERE a.x = b.y` otherwise plans as a cross product
+//! followed by a filter, and the executor can't use a hash join for it.
+//! General predicate pushdown (filters into scans, through projections and
+//! outer joins) is the optimizer's job in Phase 5.
 
-use crate::ast::JoinKind;
+use std::collections::HashSet;
+
+use crate::ast::{BinaryOp, JoinKind};
 use crate::bound::{
     fmt_expr, AggregateCall, BoundExpr, BoundOrderBy, BoundQuery, BoundTableRef, ColumnId,
     ColumnInfo, ExprKind, GroupKey,
 };
+use crate::types::Type;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Plan {
@@ -71,11 +81,19 @@ pub fn plan_query(q: &BoundQuery) -> Plan {
         Some(from) => plan_table_ref(from),
         None => Plan::SingleRow,
     };
-    if let Some(predicate) = &q.filter {
-        plan = Plan::Filter {
-            input: Box::new(plan),
-            predicate: predicate.clone(),
-        };
+    if let Some(filter) = &q.filter {
+        let mut slots: Vec<Option<BoundExpr>> = split_conjuncts(filter.clone())
+            .into_iter()
+            .map(Some)
+            .collect();
+        let from_columns: HashSet<ColumnId> = plan.output().into_iter().collect();
+        plan = place_join_conditions(plan, &mut slots, &from_columns);
+        if let Some(predicate) = conjoin(slots.into_iter().flatten().collect()) {
+            plan = Plan::Filter {
+                input: Box::new(plan),
+                predicate,
+            };
+        }
     }
     if q.is_aggregate() {
         plan = Plan::Aggregate {
@@ -167,6 +185,207 @@ fn plan_table_ref(t: &BoundTableRef) -> Plan {
     }
 }
 
+/// Moves each WHERE conjunct that references both sides of an inner or cross
+/// join into the lowest such join's condition. A cross join that gains a
+/// condition becomes an inner join; the two are equivalent for any condition.
+///
+/// Outer joins are not entered: moving a condition below a LEFT JOIN changes
+/// its result. Conjuncts containing subqueries stay in WHERE, because their
+/// correlated column references aren't visible to this analysis.
+/// `from_columns` is every column the FROM clause produces; columns outside
+/// it are outer (correlated) references and act as constants here.
+fn place_join_conditions(
+    plan: Plan,
+    slots: &mut [Option<BoundExpr>],
+    from_columns: &HashSet<ColumnId>,
+) -> Plan {
+    let Plan::Join {
+        left,
+        right,
+        kind,
+        on,
+    } = plan
+    else {
+        return plan;
+    };
+    if !matches!(kind, JoinKind::Inner | JoinKind::Cross) {
+        return Plan::Join {
+            left,
+            right,
+            kind,
+            on,
+        };
+    }
+    // Children first, so each conjunct lands at the lowest join that covers it.
+    let left = place_join_conditions(*left, slots, from_columns);
+    let right = place_join_conditions(*right, slots, from_columns);
+    let (l, r): (HashSet<ColumnId>, HashSet<ColumnId>) = (
+        left.output().into_iter().collect(),
+        right.output().into_iter().collect(),
+    );
+    let mut parts = on.map(split_conjuncts).unwrap_or_default();
+    for slot in slots.iter_mut() {
+        let belongs_here = slot.as_ref().is_some_and(|c| {
+            if contains_subquery(c) {
+                return false;
+            }
+            let local: Vec<ColumnId> = columns_of(c)
+                .into_iter()
+                .filter(|id| from_columns.contains(id))
+                .collect();
+            local.iter().all(|id| l.contains(id) || r.contains(id))
+                && local.iter().any(|id| l.contains(id))
+                && local.iter().any(|id| r.contains(id))
+        });
+        if belongs_here {
+            parts.extend(slot.take());
+        }
+    }
+    let kind = if kind == JoinKind::Cross && !parts.is_empty() {
+        JoinKind::Inner
+    } else {
+        kind
+    };
+    Plan::Join {
+        left: Box::new(left),
+        right: Box::new(right),
+        kind,
+        on: conjoin(parts),
+    }
+}
+
+/// Splits `a AND b AND c` into `[a, b, c]`.
+pub fn split_conjuncts(e: BoundExpr) -> Vec<BoundExpr> {
+    let mut out = Vec::new();
+    let mut stack = vec![e];
+    while let Some(e) = stack.pop() {
+        match e.kind {
+            ExprKind::Binary {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => {
+                stack.push(*right);
+                stack.push(*left);
+            }
+            kind => out.push(BoundExpr::new(kind, e.ty)),
+        }
+    }
+    out
+}
+
+/// The inverse of `split_conjuncts`: `[a, b, c]` becomes `(a AND b) AND c`.
+pub fn conjoin(parts: Vec<BoundExpr>) -> Option<BoundExpr> {
+    parts.into_iter().reduce(|acc, e| {
+        BoundExpr::new(
+            ExprKind::Binary {
+                left: Box::new(acc),
+                op: BinaryOp::And,
+                right: Box::new(e),
+            },
+            Type::Boolean,
+        )
+    })
+}
+
+fn columns_of(e: &BoundExpr) -> HashSet<ColumnId> {
+    let mut cols = HashSet::new();
+    e.walk(&mut |x| {
+        if let ExprKind::Column(id) = x.kind {
+            cols.insert(id);
+        }
+    });
+    cols
+}
+
+fn contains_subquery(e: &BoundExpr) -> bool {
+    let mut found = false;
+    e.walk(&mut |x| found |= matches!(x.kind, ExprKind::Subquery { .. }));
+    found
+}
+
+/// A join condition split into equality keys and everything else. Borrows
+/// from the plan, so the executor can hold it for the life of the operator.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinKeys<'a> {
+    /// `(left expression, right expression)` pairs that must be equal.
+    pub keys: Vec<(&'a BoundExpr, &'a BoundExpr)>,
+    /// The remaining conjuncts; a key match counts only if all are TRUE.
+    pub residual: Vec<&'a BoundExpr>,
+}
+
+/// Borrowing version of `split_conjuncts`.
+fn conjuncts_ref<'a>(e: &'a BoundExpr, out: &mut Vec<&'a BoundExpr>) {
+    match &e.kind {
+        ExprKind::Binary {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => {
+            conjuncts_ref(left, out);
+            conjuncts_ref(right, out);
+        }
+        _ => out.push(e),
+    }
+}
+
+#[derive(PartialEq)]
+enum Side {
+    None,
+    Left,
+    Right,
+    Both,
+}
+
+/// Splits a join condition into hash-join keys and a residual. A conjunct
+/// `x = y` is a key when `x` reads only left columns and `y` only right
+/// columns (or the reverse, which is swapped). Columns from neither side are
+/// outer references and count as constants.
+pub fn join_keys<'a>(on: &'a BoundExpr, left: &[ColumnId], right: &[ColumnId]) -> JoinKeys<'a> {
+    let side = |e: &BoundExpr| {
+        if contains_subquery(e) {
+            return Side::Both; // never a key
+        }
+        let cols = columns_of(e);
+        let in_left = cols.iter().any(|id| left.contains(id));
+        let in_right = cols.iter().any(|id| right.contains(id));
+        match (in_left, in_right) {
+            (false, false) => Side::None,
+            (true, false) => Side::Left,
+            (false, true) => Side::Right,
+            (true, true) => Side::Both,
+        }
+    };
+    let mut parts = Vec::new();
+    conjuncts_ref(on, &mut parts);
+    let mut split = JoinKeys {
+        keys: Vec::new(),
+        residual: Vec::new(),
+    };
+    for conjunct in parts {
+        if let ExprKind::Binary {
+            left: a,
+            op: BinaryOp::Eq,
+            right: b,
+        } = &conjunct.kind
+        {
+            match (side(a), side(b)) {
+                (Side::Left, Side::Right) => {
+                    split.keys.push((&**a, &**b));
+                    continue;
+                }
+                (Side::Right, Side::Left) => {
+                    split.keys.push((&**b, &**a));
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        split.residual.push(conjunct);
+    }
+    split
+}
+
 impl Plan {
     /// Ids of the columns this node produces, in row order.
     pub fn output(&self) -> Vec<ColumnId> {
@@ -256,17 +475,50 @@ fn explain_into(plan: &Plan, cols: &[ColumnInfo], indent: usize, out: &mut Strin
                 .collect();
             format!("Project {}", items.join(", "))
         }
-        Plan::Join { kind, on, .. } => {
+        Plan::Join {
+            left,
+            right,
+            kind,
+            on,
+        } => {
             let kind = match kind {
-                JoinKind::Inner => "InnerJoin",
-                JoinKind::Left => "LeftJoin",
-                JoinKind::Right => "RightJoin",
-                JoinKind::Full => "FullJoin",
-                JoinKind::Cross => "CrossJoin",
+                JoinKind::Inner => "Inner",
+                JoinKind::Left => "Left",
+                JoinKind::Right => "Right",
+                JoinKind::Full => "Full",
+                JoinKind::Cross => "Cross",
             };
-            match on {
-                Some(on) => format!("{kind} on {}", fmt_expr(cols, on, &mut subs)),
-                None => kind.to_string(),
+            let split = on
+                .as_ref()
+                .map(|on| join_keys(on, &left.output(), &right.output()));
+            match split {
+                Some(JoinKeys { keys, residual }) if !keys.is_empty() => {
+                    let keys: Vec<String> = keys
+                        .iter()
+                        .map(|(l, r)| {
+                            format!(
+                                "{} = {}",
+                                fmt_expr(cols, l, &mut subs),
+                                fmt_expr(cols, r, &mut subs)
+                            )
+                        })
+                        .collect();
+                    let mut text = format!("HashJoin {kind} keys=[{}]", keys.join(", "));
+                    if !residual.is_empty() {
+                        let parts: Vec<String> = residual
+                            .iter()
+                            .map(|r| fmt_expr(cols, r, &mut subs))
+                            .collect();
+                        text += &format!(" residual=[{}]", parts.join(", "));
+                    }
+                    text
+                }
+                _ => match on {
+                    Some(on) => {
+                        format!("NestedLoopJoin {kind} on {}", fmt_expr(cols, on, &mut subs))
+                    }
+                    None => format!("NestedLoopJoin {kind}"),
+                },
             }
         }
         Plan::Aggregate {

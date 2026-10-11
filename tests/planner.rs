@@ -141,19 +141,99 @@ fn derived_tables_are_renamed_to_outer_ids() {
 }
 
 #[test]
-fn comma_joins_become_left_deep_cross_joins() {
+fn comma_join_conditions_move_from_where_into_the_joins() {
     let b = bound(tpch::Q8);
     let mut node = plan_query(&b.query);
     while !matches!(node, Plan::Join { .. }) {
         node = node.children()[0].clone();
     }
-    let mut depth = 0;
-    while let Plan::Join { left, kind, .. } = node {
-        assert_eq!(kind, JoinKind::Cross);
-        depth += 1;
+    // Walk the left-deep chain from the top join down.
+    let mut kinds = Vec::new();
+    while let Plan::Join { left, kind, on, .. } = node {
+        kinds.push((kind, on.is_some()));
         node = *left;
     }
-    assert_eq!(depth, 7, "8 tables in FROM need 7 joins");
+    assert_eq!(kinds.len(), 7, "8 tables in FROM need 7 joins");
+    // Every join gets a condition except the bottom one: part and supplier
+    // share no condition, so they remain a cross product until join
+    // reordering (Phase 5b) puts lineitem between them.
+    assert_eq!(kinds[6], (JoinKind::Cross, false));
+    assert!(
+        kinds[..6].iter().all(|&k| k == (JoinKind::Inner, true)),
+        "{kinds:?}"
+    );
+}
+
+#[test]
+fn single_table_and_subquery_conditions_stay_in_where() {
+    let b = bound(
+        "SELECT 1 FROM t AS x, t AS y WHERE x.a = y.a AND x.b > 1 AND y.s IN (SELECT s FROM t)",
+    );
+    let plan = plan_query(&b.query);
+    let Plan::Project { input, .. } = &plan else {
+        panic!()
+    };
+    let Plan::Filter {
+        input: join,
+        predicate,
+    } = &**input
+    else {
+        panic!("expected a Filter: {plan:?}")
+    };
+    let text = plan.explain(&b.columns);
+    assert!(text.contains("HashJoin Inner keys=[x.a = y.a]"), "{text}");
+    // x.b > 1 and the IN subquery remain in the filter above the join.
+    assert!(matches!(
+        predicate.kind,
+        quarry::bound::ExprKind::Binary { .. }
+    ));
+    assert!(
+        text.contains("Filter ((x.b > 1) AND y.s IN $sub0)"),
+        "{text}"
+    );
+    assert!(matches!(
+        **join,
+        Plan::Join {
+            kind: JoinKind::Inner,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn conditions_are_not_moved_into_outer_joins() {
+    // Moving `y.a = 1` into the LEFT JOIN would keep x rows it should drop.
+    let b = bound("SELECT 1 FROM t AS x LEFT JOIN t AS y ON x.a = y.a WHERE y.a = 1 OR x.a = y.b");
+    let text = plan_query(&b.query).explain(&b.columns);
+    assert!(
+        text.contains("Filter ((y.a = 1) OR (CAST(x.a AS DOUBLE) = y.b))"),
+        "{text}"
+    );
+    assert!(text.contains("HashJoin Left keys=[x.a = y.a]"), "{text}");
+}
+
+#[test]
+fn non_equality_joins_use_a_nested_loop() {
+    let b = bound("SELECT 1 FROM t AS x JOIN t AS y ON x.a < y.a");
+    let text = plan_query(&b.query).explain(&b.columns);
+    assert!(
+        text.contains("NestedLoopJoin Inner on (x.a < y.a)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn equality_with_expressions_and_residuals() {
+    let b =
+        bound("SELECT 1 FROM t AS x JOIN t AS y ON y.a + 1 = x.a * 2 AND x.s <> y.s AND x.b = 3");
+    let text = plan_query(&b.query).explain(&b.columns);
+    // The key is swapped so the left input's expression comes first.
+    assert!(
+        text.contains(
+            "HashJoin Inner keys=[(x.a * 2) = (y.a + 1)] residual=[(x.s <> y.s), (x.b = 3)]"
+        ),
+        "{text}"
+    );
 }
 
 #[test]
