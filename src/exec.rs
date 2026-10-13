@@ -29,6 +29,7 @@ use crate::catalog::{Catalog, Field, Table};
 use crate::eval::{
     compare, eval, eval_predicate, ExecError, Layout, Result, Row, Scope, SubqueryRunner,
 };
+use crate::optimizer::optimize;
 use crate::plan::{join_keys, plan_query, JoinKeys, Plan};
 use crate::types::Value;
 
@@ -50,11 +51,16 @@ pub struct ExecOptions {
     /// Use a hash join whenever the join condition has an equality between
     /// the two sides. When false, every join is a nested loop.
     pub hash_join: bool,
+    /// Run the rule-based optimizer on every plan (including subqueries).
+    pub optimize: bool,
 }
 
 impl Default for ExecOptions {
     fn default() -> Self {
-        ExecOptions { hash_join: true }
+        ExecOptions {
+            hash_join: true,
+            optimize: true,
+        }
     }
 }
 
@@ -106,7 +112,12 @@ impl<'c> Executor<'c> {
         if let Some(plan) = self.plans.borrow().get(&key) {
             return Rc::clone(plan);
         }
-        let plan = Rc::new(plan_query(q));
+        let plan = plan_query(q);
+        let plan = Rc::new(if self.options.optimize {
+            optimize(plan)
+        } else {
+            plan
+        });
         self.plans.borrow_mut().insert(key, Rc::clone(&plan));
         plan
     }
@@ -127,12 +138,16 @@ impl<'c> Executor<'c> {
     {
         Ok(match plan {
             Plan::SingleRow => Box::new(SingleRow { done: false }),
-            Plan::Scan { table, .. } => {
+            Plan::Scan { table, indices, .. } => {
                 let catalog: &'c Catalog = self.catalog;
                 let table = catalog
                     .get(table)
                     .ok_or_else(|| ExecError(format!("table \"{table}\" does not exist")))?;
-                Box::new(Scan { table, pos: 0 })
+                Box::new(Scan {
+                    table,
+                    indices,
+                    pos: 0,
+                })
             }
             Plan::Filter { input, predicate } => Box::new(Filter {
                 layout: Layout::new(&input.output()),
@@ -284,8 +299,11 @@ impl Operator for SingleRow {
     }
 }
 
+/// Reads only the table columns listed in `indices`, so pruned columns are
+/// never copied out of storage.
 struct Scan<'p> {
     table: &'p Table,
+    indices: &'p [usize],
     pos: usize,
 }
 
@@ -294,7 +312,11 @@ impl Operator for Scan<'_> {
         if self.pos >= self.table.row_count() {
             return Ok(None);
         }
-        let row = self.table.row(self.pos);
+        let row = self
+            .indices
+            .iter()
+            .map(|&i| self.table.columns[i].get(self.pos))
+            .collect();
         self.pos += 1;
         Ok(Some(row))
     }

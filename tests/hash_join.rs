@@ -20,12 +20,26 @@ fn catalog(tables: &[(&str, &str)]) -> Catalog {
 fn rows(c: &Catalog, sql: &str) -> Vec<Vec<String>> {
     let q = parse_query(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     let b = bind(c, &q).unwrap_or_else(|e| panic!("{sql}: {e}"));
-    let hashed = execute_with(c, &b, ExecOptions { hash_join: true })
-        .unwrap()
-        .rows;
-    let looped = execute_with(c, &b, ExecOptions { hash_join: false })
-        .unwrap()
-        .rows;
+    let hashed = execute_with(
+        c,
+        &b,
+        ExecOptions {
+            hash_join: true,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .rows;
+    let looped = execute_with(
+        c,
+        &b,
+        ExecOptions {
+            hash_join: false,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .rows;
     assert_eq!(
         hashed, looped,
         "hash and nested-loop joins disagree on {sql}"

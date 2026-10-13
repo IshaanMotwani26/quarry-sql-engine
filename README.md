@@ -1,16 +1,16 @@
 # Quarry
 
-A vectorized SQL query engine written from scratch in Rust, with no dependencies. It runs TPC-H queries on generated data with hash joins and hash aggregation.
+A vectorized SQL query engine written from scratch in Rust, with no dependencies. It runs TPC-H queries on generated data with a rule-based optimizer, hash joins, and hash aggregation.
 
 ```
-SQL text → lexer → parser → AST → binder → logical plan → executor → optimizer → vectorized execution
-           └──────────────────────── done ─────────────────────────┘
+SQL text → lexer → parser → AST → binder → logical plan → optimizer → executor → vectorized execution
+           └────────────────────────────── done ───────────────────────────────┘
 ```
 
 ## Quick start
 
 ```bash
-cargo test            # 153 tests: parser, binder, planner, evaluator, joins, aggregation, TPC-H
+cargo test            # 176 tests: parser, binder, planner, optimizer, evaluator, joins, aggregation, TPC-H
 cargo run --release   # REPL; \? lists commands, \demo loads sample tables
 ```
 
@@ -39,12 +39,14 @@ Limit 10
   Sort revenue DESC NULLS FIRST, o_orderdate ASC NULLS LAST
     Project l_orderkey, revenue := sum(l_extendedprice * (1 - l_discount)), o_orderdate, o_shippriority
       Aggregate keys=[lineitem.l_orderkey, orders.o_orderdate, orders.o_shippriority] aggs=[...]
-        Filter (((customer.c_mktsegment = 'BUILDING') AND ...))
-          HashJoin Inner keys=[orders.o_orderkey = lineitem.l_orderkey]
-            HashJoin Inner keys=[customer.c_custkey = orders.o_custkey]
-              Scan customer
-              Scan orders
-            Scan lineitem
+        HashJoin Inner keys=[orders.o_orderkey = lineitem.l_orderkey]
+          HashJoin Inner keys=[customer.c_custkey = orders.o_custkey]
+            Filter (customer.c_mktsegment = 'BUILDING')
+              Scan customer [2/8 columns: c_custkey, c_mktsegment]
+            Filter (orders.o_orderdate < DATE '1995-03-15')
+              Scan orders [4/9 columns: o_orderkey, o_custkey, o_orderdate, o_shippriority]
+          Filter (lineitem.l_shipdate > DATE '1995-03-15')
+            Scan lineitem [4/16 columns: l_orderkey, l_extendedprice, l_discount, l_shipdate]
  l_orderkey |      revenue       | o_orderdate | o_shippriority
 ------------+--------------------+-------------+----------------
       13166 |        337532.7514 | 1995-02-14  |              0
@@ -103,10 +105,32 @@ All six TPC-H queries in `src/tpch.rs` bind with the correct output schemas.
 
 Doubling the data roughly doubles the hash join's time and quadruples the nested loop's.
 
+## Phase 5a: Rule-based optimizer (complete)
+
+`src/optimizer.rs` rewrites every plan, including subquery plans, before execution. `\optimize` in the REPL turns it off for comparison.
+
+- **Constant folding**: expressions that read no columns are evaluated once at plan time (`DATE '1998-12-01' - INTERVAL '90' DAY` becomes `DATE '1998-09-02'`), boolean logic is simplified (`x AND TRUE` becomes `x`), and always-true filters are removed. Expressions that would fail, such as `1 / 0`, are left alone so the error only happens if the row actually reaches them.
+- **Filter pushdown**: each condition moves as far down as is legal. Single-table conditions land on their table's scan, and conditions spanning both sides of an inner join become join conditions. Conditions on GROUP BY keys move below the aggregate, and conditions pass through derived tables, sorts, and DISTINCT. Outer joins follow the precise rules: a WHERE condition can move into the preserved side, an ON condition can move into the optional side, and nothing moves across a FULL JOIN. Nothing moves below a LIMIT or a scalar aggregate.
+- **Projection pruning**: each node keeps only the columns something above it reads. Scans copy only those columns out of storage (Q6 reads 4 of lineitem's 16), unused aggregates are dropped, and columns referenced only by correlated subqueries are kept.
+- **Tests**: every TPC-H query, plus 1,200 randomized queries covering outer joins, derived tables, grouping, LIMIT, DISTINCT, and correlated subqueries, must give bit-identical results with and without the optimizer. Each of five classic optimizer bugs fails at least one test. Those bugs are: pushing past the NULL-padded side of an outer join, pushing a preserved-side ON condition, pushing through LIMIT, pushing below a scalar aggregate, and pruning a correlated column. The scalar-aggregate case initially went undetected, which led to a stronger test.
+
+**Optimizer off vs on**, TPC-H scale 0.05 (300k lineitem rows), release build, best of 3:
+
+| Query | Off | On | Speedup |
+|---|---|---|---|
+| Q1 | 371 ms | 324 ms | 1.1× |
+| Q3 | 1,207 ms | 164 ms | 7.4× |
+| Q6 | 173 ms | 70 ms | 2.5× |
+| Q8 | 10,816 ms | 345 ms | 31× |
+| Q13 | 305 ms | 189 ms | 1.6× |
+| Q22 | 41,694 ms | 40,137 ms | 1.0× |
+
+Q8 gains the most: filtering `part` before its cross product with `supplier` shrinks that product about 150-fold. Q22 is dominated by a correlated `NOT EXISTS` that re-runs once per customer, which no rule here changes; that's subquery decorrelation, in 5b.
+
 ## Known limitations
 
 - **DECIMAL is stored as DOUBLE.** TPC-H's prices and discounts are exact decimals. In binary floating point, `0.06 + 0.01` is `0.06999…`, so Q6's `l_discount BETWEEN 0.05 AND 0.07` drops every 7% discount that a real database would keep. An exact decimal type is needed before Phase 8 can validate against the official TPC-H answers.
-- **No optimizer yet.** Single-table filters run after all joins rather than at the scans, Q8's FROM order forces a `part × supplier` cross product, and Q22's correlated `NOT EXISTS` re-runs once per customer. Phase 5 fixes all three.
+- **Join order follows the FROM clause** (Q8 still has a small `part × supplier` cross product), and **correlated subqueries re-run per outer row** (Q22 is quadratic). Phase 5b adds join reordering and decorrelation.
 - **Tables live in memory only** and disappear when the REPL exits; on-disk storage comes with the Parquet reader (7a).
 
 ## Roadmap
@@ -115,7 +139,7 @@ Doubling the data roughly doubles the hash join's time and quadruples the nested
 - [x] **2. Catalog + binder**: schemas, name resolution, type checking, CSV loading
 - [x] **3. Planner + executor**: 3a logical planner and expression evaluator; 3b Volcano executor (first end-to-end queries)
 - [x] **4. Aggregation + hash join**: 4a hash aggregation; 4b hash join and TPC-H data generator
-- [ ] **5. Optimizer**: 5a filter pushdown to scans and through projections/outer joins, projection pruning, constant folding; 5b join reordering, subquery decorrelation
+- [ ] **5. Optimizer**: 5a constant folding, filter pushdown, projection pruning (done); 5b join reordering, subquery decorrelation
 - [ ] **6. Vectorized execution**: 6a columnar batches and vectorized expressions; 6b vectorized operators, benchmarked against the Volcano baseline
 - [ ] **7. Interop**: 7a Parquet reader; 7b Postgres wire protocol (connect with `psql` and psycopg)
 - [ ] **8. Evaluation**: 8a TPC-H SF1 benchmarks vs SQLite/DuckDB; 8b differential testing against DuckDB

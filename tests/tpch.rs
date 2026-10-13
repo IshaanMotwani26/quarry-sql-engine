@@ -15,9 +15,16 @@ fn generated(scale: f64) -> Catalog {
 fn run(catalog: &Catalog, sql: &str, hash_join: bool) -> Vec<Vec<Value>> {
     let q = parse_query(sql).unwrap();
     let b = bind(catalog, &q).unwrap();
-    execute_with(catalog, &b, ExecOptions { hash_join })
-        .unwrap_or_else(|e| panic!("{sql}: {e}"))
-        .rows
+    execute_with(
+        catalog,
+        &b,
+        ExecOptions {
+            hash_join,
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|e| panic!("{sql}: {e}"))
+    .rows
 }
 
 /// Reads one column of a table by name.

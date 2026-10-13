@@ -12,6 +12,7 @@ use quarry::ast::Statement;
 use quarry::catalog::Catalog;
 use quarry::csv::{parse_csv, read_csv_file, CsvOptions};
 use quarry::exec::{execute_with, ExecOptions, QueryResult};
+use quarry::optimizer::optimize;
 use quarry::types::{Type, Value};
 use quarry::{bind, parse_statements, plan_query, tpch, ParseError};
 
@@ -28,6 +29,7 @@ const HELP: &str = "\
   \\explain                       toggle printing the logical plan
   \\timing                        toggle printing execution time
   \\hashjoin                      toggle hash joins (off = nested-loop joins only)
+  \\optimize                      toggle the optimizer (off = run plans as written)
   \\q                             quit";
 
 const DEMO_DEPT: &str = "\
@@ -180,6 +182,10 @@ impl Session {
                 }
                 _ => eprintln!("error: scale must be a number in (0, 1], e.g. \\tpch 0.01"),
             },
+            ["\\optimize"] => {
+                self.options.optimize = !self.options.optimize;
+                println!("optimizer {}", on_off(self.options.optimize));
+            }
             ["\\hashjoin"] => {
                 self.options.hash_join = !self.options.hash_join;
                 println!("hash joins {}", on_off(self.options.hash_join));
@@ -270,7 +276,10 @@ impl Session {
                 print!("{}", bound.explain());
             }
             if self.show_explain {
-                print!("{}", plan_query(&bound.query).explain(&bound.columns));
+                let plan = plan_query(&bound.query);
+                let optimized = self.options.optimize;
+                let plan = if optimized { optimize(plan) } else { plan };
+                print!("{}", plan.explain_with(&bound.columns, optimized));
             }
             let start = Instant::now();
             match execute_with(&self.catalog, &bound, self.options) {

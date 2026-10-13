@@ -33,10 +33,15 @@ use crate::types::Type;
 pub enum Plan {
     /// One row with no columns: the input to a SELECT with no FROM clause.
     SingleRow,
-    /// Reads a base table. `columns[i]` is the id of the table's i-th column.
+    /// Reads a base table. Produces the table columns at positions
+    /// `indices`, under the ids `columns` (same length). Unpruned, `indices`
+    /// is `0..width`; projection pruning removes columns nothing reads.
     Scan {
         table: String,
         columns: Vec<ColumnId>,
+        indices: Vec<usize>,
+        /// The table's total column count, for `\explain`.
+        width: usize,
     },
     /// Keeps rows where `predicate` is TRUE (NULL and FALSE are dropped).
     Filter {
@@ -156,6 +161,8 @@ fn plan_table_ref(t: &BoundTableRef) -> Plan {
         BoundTableRef::Base { table, columns } => Plan::Scan {
             table: table.clone(),
             columns: columns.clone(),
+            indices: (0..columns.len()).collect(),
+            width: columns.len(),
         },
         BoundTableRef::Derived { query, columns } => {
             // A derived table is its own plan, renamed to the ids the outer
@@ -288,7 +295,7 @@ pub fn conjoin(parts: Vec<BoundExpr>) -> Option<BoundExpr> {
     })
 }
 
-fn columns_of(e: &BoundExpr) -> HashSet<ColumnId> {
+pub(crate) fn columns_of(e: &BoundExpr) -> HashSet<ColumnId> {
     let mut cols = HashSet::new();
     e.walk(&mut |x| {
         if let ExprKind::Column(id) = x.kind {
@@ -298,7 +305,7 @@ fn columns_of(e: &BoundExpr) -> HashSet<ColumnId> {
     cols
 }
 
-fn contains_subquery(e: &BoundExpr) -> bool {
+pub(crate) fn contains_subquery(e: &BoundExpr) -> bool {
     let mut found = false;
     e.walk(&mut |x| found |= matches!(x.kind, ExprKind::Subquery { .. }));
     found
@@ -431,8 +438,14 @@ impl Plan {
     /// Subqueries inside expressions appear as `$subN` with their own plans
     /// printed underneath the node that uses them.
     pub fn explain(&self, cols: &[ColumnInfo]) -> String {
+        self.explain_with(cols, false)
+    }
+
+    /// Like `explain`; with `optimized`, subquery plans are shown optimized
+    /// too (pass it when `self` came from the optimizer).
+    pub fn explain_with(&self, cols: &[ColumnInfo], optimized: bool) -> String {
         let mut out = String::new();
-        explain_into(self, cols, 0, &mut out);
+        explain_into(self, cols, 0, optimized, &mut out);
         out
     }
 }
@@ -443,18 +456,41 @@ fn line(out: &mut String, indent: usize, text: &str) {
     out.push('\n');
 }
 
-fn explain_into(plan: &Plan, cols: &[ColumnInfo], indent: usize, out: &mut String) {
+fn explain_into(
+    plan: &Plan,
+    cols: &[ColumnInfo],
+    indent: usize,
+    optimized: bool,
+    out: &mut String,
+) {
     let name = |id: ColumnId| cols[id].display_name();
     let mut subs: Vec<&BoundQuery> = Vec::new();
     let text = match plan {
         Plan::SingleRow => "SingleRow".to_string(),
-        Plan::Scan { table, columns } => match columns
-            .first()
-            .and_then(|&id| cols[id].qualifier.as_deref())
-        {
-            Some(alias) if alias != table => format!("Scan {table} AS {alias}"),
-            _ => format!("Scan {table}"),
-        },
+        Plan::Scan {
+            table,
+            columns,
+            width,
+            ..
+        } => {
+            let mut text = match columns
+                .first()
+                .and_then(|&id| cols[id].qualifier.as_deref())
+            {
+                Some(alias) if alias != table => format!("Scan {table} AS {alias}"),
+                _ => format!("Scan {table}"),
+            };
+            if columns.len() < *width {
+                let names: Vec<&str> = columns.iter().map(|&id| cols[id].name.as_str()).collect();
+                text += &format!(
+                    " [{}/{} columns: {}]",
+                    columns.len(),
+                    width,
+                    names.join(", ")
+                );
+            }
+            text
+        }
         Plan::Filter { predicate, .. } => {
             format!("Filter {}", fmt_expr(cols, predicate, &mut subs))
         }
@@ -577,9 +613,15 @@ fn explain_into(plan: &Plan, cols: &[ColumnInfo], indent: usize, out: &mut Strin
             " (correlated)"
         };
         line(out, indent + 2, &format!("$sub{n}{corr}:"));
-        explain_into(&plan_query(sub), cols, indent + 3, out);
+        let sub_plan = plan_query(sub);
+        let sub_plan = if optimized {
+            crate::optimizer::optimize(sub_plan)
+        } else {
+            sub_plan
+        };
+        explain_into(&sub_plan, cols, indent + 3, optimized, out);
     }
     for child in plan.children() {
-        explain_into(child, cols, indent + 1, out);
+        explain_into(child, cols, indent + 1, optimized, out);
     }
 }
