@@ -1,6 +1,7 @@
 //! Optimizer tests: plan shapes for each rule, and result equivalence. Every
 //! query that runs here runs twice, with and without the optimizer, and the
-//! results must be identical (including row order and float bits).
+//! results must match: the same rows (in the same order, if the query has an
+//! ORDER BY), with floats equal to within rounding.
 
 use quarry::bound::Bound;
 use quarry::catalog::{Catalog, Schema, Table};
@@ -32,8 +33,45 @@ fn explain(c: &Catalog, sql: &str) -> String {
     optimize(plan_query(&b.query)).explain_with(&b.columns, true)
 }
 
-/// Runs with and without the optimizer, asserts identical results, and
-/// returns them as strings.
+/// Two values are the same result if equal, or floats within 1e-9 relative
+/// error: summing in a different order can change the last bits.
+fn same_value(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Float64(x), Value::Float64(y)) => {
+            x == y || (x - y).abs() <= 1e-9 * x.abs().max(y.abs())
+        }
+        _ => a == b,
+    }
+}
+
+/// Sort key for comparing unordered results; floats are rounded so values
+/// that differ only in the last bits sort together.
+fn sort_key(row: &[Value]) -> Vec<String> {
+    row.iter()
+        .map(|v| match v {
+            Value::Float64(x) => format!("{x:.6e}"),
+            other => format!("{other:?}"),
+        })
+        .collect()
+}
+
+/// Compares two results. SQL defines row order only under ORDER BY, and
+/// the optimizer may change it otherwise (for example by reordering joins),
+/// so unordered results are compared as multisets.
+fn same_rows(a: &[Vec<Value>], b: &[Vec<Value>], ordered: bool) -> bool {
+    let (mut a, mut b) = (a.to_vec(), b.to_vec());
+    if !ordered {
+        a.sort_by_cached_key(|r| sort_key(r));
+        b.sort_by_cached_key(|r| sort_key(r));
+    }
+    a.len() == b.len()
+        && a.iter()
+            .zip(&b)
+            .all(|(x, y)| x.len() == y.len() && x.iter().zip(y).all(|(u, v)| same_value(u, v)))
+}
+
+/// Runs with and without the optimizer, asserts the results match, and
+/// returns the optimized result as strings.
 fn rows(c: &Catalog, sql: &str) -> Vec<Vec<String>> {
     let b = bound(c, sql);
     let run = |optimize| {
@@ -49,7 +87,11 @@ fn rows(c: &Catalog, sql: &str) -> Vec<Vec<String>> {
         .rows
     };
     let (optimized, plain) = (run(true), run(false));
-    assert_eq!(optimized, plain, "optimizer changed the result of {sql}");
+    let ordered = !b.query.order_by.is_empty();
+    assert!(
+        same_rows(&optimized, &plain, ordered),
+        "optimizer changed the result of {sql}\noptimized: {optimized:?}\nplain:     {plain:?}"
+    );
     optimized
         .iter()
         .map(|r| {
@@ -332,6 +374,39 @@ fn unused_aggregates_are_dropped() {
 // ---------------------------------------------------------------------------
 // End to end
 // ---------------------------------------------------------------------------
+
+#[test]
+fn result_comparison_ignores_order_only_without_order_by() {
+    let (one, two) = (vec![Value::Int64(1)], vec![Value::Int64(2)]);
+    assert!(same_rows(
+        &[one.clone(), two.clone()],
+        &[two.clone(), one.clone()],
+        false
+    ));
+    assert!(!same_rows(
+        &[one.clone(), two.clone()],
+        &[two.clone(), one.clone()],
+        true
+    ));
+    assert!(
+        !same_rows(
+            &[one.clone(), one.clone()],
+            &[one.clone(), two.clone()],
+            false
+        ),
+        "multisets, not sets"
+    );
+    assert!(same_rows(
+        &[vec![Value::Float64(0.1 + 0.2)]],
+        &[vec![Value::Float64(0.3)]],
+        true
+    ));
+    assert!(!same_rows(
+        &[vec![Value::Float64(0.3)]],
+        &[vec![Value::Float64(0.31)]],
+        true
+    ));
+}
 
 #[test]
 fn every_tpch_query_gives_identical_results_with_and_without_the_optimizer() {
