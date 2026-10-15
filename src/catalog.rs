@@ -4,9 +4,11 @@
 //! than row-by-row. Phase 3 reads them a row at a time, but Phase 6's
 //! vectorized executor can scan these vectors directly.
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
+use crate::agg::KeyValue;
 use crate::types::{Type, Value};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -218,9 +220,40 @@ impl Table {
     }
 }
 
+/// Facts about one column's data, used by the optimizer to estimate how many
+/// rows each step of a plan produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnStats {
+    /// Number of distinct non-NULL values.
+    pub distinct: usize,
+    pub nulls: usize,
+}
+
+impl ColumnStats {
+    fn compute(column: &Column) -> ColumnStats {
+        let mut seen = HashSet::new();
+        let mut nulls = 0;
+        for i in 0..column.len() {
+            match column.get(i) {
+                Value::Null => nulls += 1,
+                v => {
+                    seen.insert(KeyValue::of(&v));
+                }
+            }
+        }
+        ColumnStats {
+            distinct: seen.len(),
+            nulls,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Catalog {
     tables: BTreeMap<String, Table>,
+    /// Column statistics, computed on first request and cached until the
+    /// table is replaced. Keyed by (table name, column index).
+    stats: RefCell<HashMap<(String, usize), ColumnStats>>,
 }
 
 impl Catalog {
@@ -237,6 +270,9 @@ impl Catalog {
     }
 
     pub fn register_or_replace(&mut self, table: Table) {
+        self.stats
+            .borrow_mut()
+            .retain(|(name, _), _| *name != table.name);
         self.tables.insert(table.name.clone(), table);
     }
 
@@ -246,5 +282,16 @@ impl Catalog {
 
     pub fn tables(&self) -> impl Iterator<Item = &Table> {
         self.tables.values()
+    }
+
+    /// Statistics for one column. The first call scans the column once.
+    pub fn column_stats(&self, table: &str, column: usize) -> Option<ColumnStats> {
+        let key = (table.to_string(), column);
+        if let Some(stats) = self.stats.borrow().get(&key) {
+            return Some(*stats);
+        }
+        let stats = ColumnStats::compute(self.get(table)?.columns.get(column)?);
+        self.stats.borrow_mut().insert(key, stats);
+        Some(stats)
     }
 }

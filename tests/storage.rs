@@ -127,3 +127,24 @@ fn catalog_rejects_duplicates_and_bad_types() {
         .is_err());
     assert!(Table::new("bad", Schema::from_pairs(&[("i", Type::Interval)])).is_err());
 }
+
+#[test]
+fn column_stats_count_distinct_values_and_nulls() {
+    let mut c = Catalog::new();
+    c.register(csv("a,b\n1,x\n2,x\n1,\n,y\n").unwrap()).unwrap();
+    let a = c.column_stats("t", 0).unwrap();
+    assert_eq!((a.distinct, a.nulls), (2, 1));
+    let b = c.column_stats("t", 1).unwrap();
+    assert_eq!((b.distinct, b.nulls), (2, 1));
+    assert_eq!(c.column_stats("t", 5), None);
+    assert_eq!(c.column_stats("nope", 0), None);
+}
+
+#[test]
+fn column_stats_are_refreshed_when_a_table_is_replaced() {
+    let mut c = Catalog::new();
+    c.register(csv("a\n1\n2\n").unwrap()).unwrap();
+    assert_eq!(c.column_stats("t", 0).unwrap().distinct, 2);
+    c.register_or_replace(csv("a\n1\n2\n3\n4\n").unwrap());
+    assert_eq!(c.column_stats("t", 0).unwrap().distinct, 4);
+}
