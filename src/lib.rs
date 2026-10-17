@@ -8,6 +8,7 @@ pub mod agg;
 pub mod ast;
 pub mod binder;
 pub mod bound;
+pub mod cardinality;
 pub mod catalog;
 pub mod csv;
 pub mod error;

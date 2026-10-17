@@ -4,6 +4,7 @@
 //! ORDER BY), with floats equal to within rounding.
 
 use quarry::bound::Bound;
+use quarry::cardinality::estimate_rows;
 use quarry::catalog::{Catalog, Schema, Table};
 use quarry::csv::{parse_csv, CsvOptions};
 use quarry::optimizer::optimize;
@@ -19,6 +20,12 @@ fn demo() -> Catalog {
         c.register(parse_csv(name, csv, &CsvOptions::default(), None).unwrap())
             .unwrap();
     }
+    c
+}
+
+fn generated(scale: f64) -> Catalog {
+    let mut c = Catalog::new();
+    tpch::generate(&mut c, scale);
     c
 }
 
@@ -369,6 +376,32 @@ fn unused_aggregates_are_dropped() {
         "SELECT k FROM (SELECT k, sum(v) AS s, max(v) AS m FROM a GROUP BY k) AS t WHERE m > 1",
     );
     assert_contains(&plan, "aggs=[max(a.v)]");
+}
+
+// ---------------------------------------------------------------------------
+// Cardinality estimation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn row_estimates_use_table_statistics() {
+    let c = generated(0.002);
+    let sizes = tpch::Sizes::at(0.002);
+    let est = |sql: &str| estimate_rows(&plan_query(&bound(&c, sql).query), &c);
+    assert_eq!(est("SELECT * FROM customer"), sizes.customer as f64);
+    // c_mktsegment has 5 distinct values, so equality keeps about a fifth.
+    let segment = est("SELECT * FROM customer WHERE c_mktsegment = 'BUILDING'");
+    assert!(
+        (segment - sizes.customer as f64 / 5.0).abs() < 1.0,
+        "{segment}"
+    );
+    // A foreign-key join produces about as many rows as the referencing side.
+    let joined = est("SELECT * FROM orders, customer WHERE o_custkey = c_custkey");
+    let ratio = joined / sizes.orders as f64;
+    assert!(
+        (0.9..=1.6).contains(&ratio),
+        "estimated {joined} rows for {} orders",
+        sizes.orders
+    );
 }
 
 // ---------------------------------------------------------------------------
