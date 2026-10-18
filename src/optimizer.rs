@@ -1,5 +1,5 @@
 //! Rule-based optimizer: rewrites a logical plan into an equivalent, cheaper
-//! one. Three passes run in order:
+//! one. Four passes run in order:
 //!
 //! 1. **Constant folding** evaluates expressions that read no columns, once,
 //!    at plan time: `DATE '1998-12-01' - INTERVAL '90' DAY` becomes
@@ -11,26 +11,33 @@
 //!    grouped, or sorted. A condition on one table lands directly above that
 //!    table's scan; a condition spanning both sides of an inner join becomes
 //!    part of that join (where it can become a hash-join key).
-//! 3. **Projection pruning** works top-down to find which columns each node's
+//! 3. **Join ordering** (`join_order.rs`) picks the order of each chain of
+//!    inner joins using row-count estimates, and builds each hash table on
+//!    the smaller input.
+//! 4. **Projection pruning** works top-down to find which columns each node's
 //!    parent actually reads, and removes the rest. Scans then copy only the
 //!    columns the query uses out of storage.
 //!
-//! Every rule preserves results exactly; the test suite checks this by
-//! running every query with and without the optimizer.
+//! Every rule preserves results (row order aside, when there's no ORDER BY);
+//! the test suite checks this by running every query with and without the
+//! optimizer.
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 
 use crate::ast::{BinaryOp, JoinKind};
 use crate::bound::{BoundExpr, ColumnId, ExprKind};
+use crate::catalog::Catalog;
 use crate::eval::{eval, Layout, NoSubqueries, Scope};
+use crate::join_order::reorder_joins;
 use crate::plan::{columns_of, conjoin, contains_subquery, split_conjuncts, Plan};
 use crate::types::Value;
 
-/// Runs all optimizer passes.
-pub fn optimize(plan: Plan) -> Plan {
+/// Runs all optimizer passes. The catalog supplies table statistics.
+pub fn optimize(plan: Plan, catalog: &Catalog) -> Plan {
     let plan = map_exprs(plan, &fold);
     let plan = push_down(plan, Vec::new());
+    let plan = reorder_joins(plan, catalog);
     // Pushdown substitutes expressions into new places; fold again.
     let plan = map_exprs(plan, &fold);
     let required: HashSet<ColumnId> = plan.output().into_iter().collect();

@@ -27,6 +27,7 @@ use crate::bound::{
     fmt_expr, AggregateCall, BoundExpr, BoundOrderBy, BoundQuery, BoundTableRef, ColumnId,
     ColumnInfo, ExprKind, GroupKey,
 };
+use crate::catalog::Catalog;
 use crate::types::Type;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -438,12 +439,12 @@ impl Plan {
     /// Subqueries inside expressions appear as `$subN` with their own plans
     /// printed underneath the node that uses them.
     pub fn explain(&self, cols: &[ColumnInfo]) -> String {
-        self.explain_with(cols, false)
+        self.explain_with(cols, None)
     }
 
-    /// Like `explain`; with `optimized`, subquery plans are shown optimized
-    /// too (pass it when `self` came from the optimizer).
-    pub fn explain_with(&self, cols: &[ColumnInfo], optimized: bool) -> String {
+    /// Like `explain`. Pass the catalog when `self` came from the optimizer,
+    /// so subquery plans are shown optimized too.
+    pub fn explain_with(&self, cols: &[ColumnInfo], optimized: Option<&Catalog>) -> String {
         let mut out = String::new();
         explain_into(self, cols, 0, optimized, &mut out);
         out
@@ -460,7 +461,7 @@ fn explain_into(
     plan: &Plan,
     cols: &[ColumnInfo],
     indent: usize,
-    optimized: bool,
+    optimized: Option<&Catalog>,
     out: &mut String,
 ) {
     let name = |id: ColumnId| cols[id].display_name();
@@ -614,10 +615,9 @@ fn explain_into(
         };
         line(out, indent + 2, &format!("$sub{n}{corr}:"));
         let sub_plan = plan_query(sub);
-        let sub_plan = if optimized {
-            crate::optimizer::optimize(sub_plan)
-        } else {
-            sub_plan
+        let sub_plan = match optimized {
+            Some(catalog) => crate::optimizer::optimize(sub_plan, catalog),
+            None => sub_plan,
         };
         explain_into(&sub_plan, cols, indent + 3, optimized, out);
     }

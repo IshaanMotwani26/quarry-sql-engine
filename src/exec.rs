@@ -114,7 +114,7 @@ impl<'c> Executor<'c> {
         }
         let plan = plan_query(q);
         let plan = Rc::new(if self.options.optimize {
-            optimize(plan)
+            optimize(plan, self.catalog)
         } else {
             plan
         });

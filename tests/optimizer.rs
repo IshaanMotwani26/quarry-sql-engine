@@ -9,6 +9,7 @@ use quarry::catalog::{Catalog, Schema, Table};
 use quarry::csv::{parse_csv, CsvOptions};
 use quarry::optimizer::optimize;
 use quarry::types::{Type, Value};
+use quarry::Plan;
 use quarry::{bind, execute_with, parse_query, plan_query, tpch, ExecOptions};
 
 const A: &str = "id,k,v,s\n1,10,5,x\n2,20,,y\n3,,7,z\n4,10,1,w\n5,30,9,x\n";
@@ -37,7 +38,7 @@ fn bound(c: &Catalog, sql: &str) -> Bound {
 /// The optimized plan, rendered.
 fn explain(c: &Catalog, sql: &str) -> String {
     let b = bound(c, sql);
-    optimize(plan_query(&b.query)).explain_with(&b.columns, true)
+    optimize(plan_query(&b.query), c).explain_with(&b.columns, Some(c))
 }
 
 /// Two values are the same result if equal, or floats within 1e-9 relative
@@ -193,18 +194,24 @@ fn filters_move_to_their_scans() {
         &c,
         "SELECT a.id FROM a, b WHERE a.k = b.k AND a.v > 2 AND b.s <> 'q'",
     );
-    assert_contains(&plan, "HashJoin Inner keys=[a.k = b.k]");
-    assert_contains(&plan, "Filter (a.v > 2)\n      Scan a");
-    assert_contains(&plan, "Filter (b.s <> 'q')\n      Scan b");
+    // Either input may end up on the build side; only placement matters here.
+    assert!(
+        plan.contains("HashJoin Inner keys=[a.k = b.k]")
+            || plan.contains("HashJoin Inner keys=[b.k = a.k]"),
+        "{plan}"
+    );
+    assert_contains(&plan, "Filter (a.v > 2)\nScan a");
+    assert_contains(&plan, "Filter (b.s <> 'q')\nScan b");
 }
 
 #[test]
 fn inner_join_on_conditions_move_like_where_conditions() {
     let c = demo();
     let plan = explain(&c, "SELECT a.id FROM a JOIN b ON a.k = b.k AND a.v > 2");
-    assert_contains(
-        &plan,
-        "HashJoin Inner keys=[a.k = b.k]\n    Filter (a.v > 2)",
+    assert_contains(&plan, "Filter (a.v > 2)\nScan a");
+    assert!(
+        !plan.contains("residual"),
+        "a.v > 2 should leave the join condition:\n{plan}"
     );
 }
 
@@ -405,6 +412,66 @@ fn row_estimates_use_table_statistics() {
 }
 
 // ---------------------------------------------------------------------------
+// Join ordering
+// ---------------------------------------------------------------------------
+
+/// Every join in the plan, as (left input, right input).
+fn joins(plan: &Plan) -> Vec<(&Plan, &Plan)> {
+    let mut out = Vec::new();
+    if let Plan::Join { left, right, .. } = plan {
+        out.push((&**left, &**right));
+    }
+    for child in plan.children() {
+        out.extend(joins(child));
+    }
+    out
+}
+
+#[test]
+fn q8_no_longer_builds_a_cross_product() {
+    let c = generated(0.002);
+    let plan = explain(&c, tpch::Q8);
+    assert!(!plan.contains("Cross"), "{plan}");
+    assert_eq!(plan.matches("HashJoin Inner").count(), 7, "{plan}");
+}
+
+#[test]
+fn a_bad_written_order_is_fixed() {
+    // Written order joins a and b first, with no condition between them.
+    let c = demo();
+    let sql = "SELECT a.id, b.id, x.id FROM a, b, a AS x WHERE a.k = x.k AND x.v = b.v";
+    let plan = explain(&c, sql);
+    assert!(!plan.contains("Cross"), "{plan}");
+    rows(&c, sql);
+}
+
+#[test]
+fn hash_tables_are_built_on_the_smaller_input() {
+    let c = generated(0.002);
+    for (n, sql) in tpch::QUERIES {
+        let b = bound(&c, sql);
+        let plan = optimize(plan_query(&b.query), &c);
+        for (left, right) in joins(&plan) {
+            let (l, r) = (estimate_rows(left, &c), estimate_rows(right, &c));
+            assert!(
+                r <= l,
+                "TPC-H Q{n}: build side estimated at {r} rows, probe side at {l}"
+            );
+        }
+    }
+}
+
+#[test]
+fn reordering_stops_at_outer_joins() {
+    let c = demo();
+    let sql = "SELECT a.id, x.id FROM a LEFT JOIN b ON a.k = b.k, a AS x WHERE x.k = a.k";
+    let plan = explain(&c, sql);
+    // The LEFT JOIN stays one unit (a with b); only its position in the chain can change.
+    assert!(plan.contains("HashJoin Left keys=[a.k = b.k]"), "{plan}");
+    rows(&c, sql);
+}
+
+// ---------------------------------------------------------------------------
 // End to end
 // ---------------------------------------------------------------------------
 
@@ -508,7 +575,7 @@ fn random_queries_give_identical_results_with_and_without_the_optimizer() {
         for _ in 0..8 {
             let kind = rng.pick(&["INNER", "LEFT", "RIGHT", "FULL"]);
             let (on, w1, w2) = (rng.pick(&preds), rng.pick(&preds), rng.pick(&preds));
-            let sql = match rng.below(7) {
+            let sql = match rng.below(8) {
                 0 => format!("SELECT a.id, b.id FROM a {kind} JOIN b ON {on} WHERE {w1} AND {w2}"),
                 1 => format!("SELECT a.id, b.id FROM a, b WHERE {w1} AND {w2}"),
                 2 => format!(
@@ -520,6 +587,10 @@ fn random_queries_give_identical_results_with_and_without_the_optimizer() {
                     rng.pick(&["b.v > 1", "1 = 1", "b.k IS NOT NULL"])
                 ),
                 4 => format!("SELECT DISTINCT a.k, b.k FROM a {kind} JOIN b ON {on} WHERE {w1}"),
+                6 => format!(
+                    "SELECT a.id, b.id, x.id FROM a, b, a AS x WHERE a.k = x.k AND {} AND {w1}",
+                    rng.pick(&["x.v = b.v", "b.k = x.k", "b.v < x.v", "1 = 1"])
+                ),
                 5 => format!(
                     "SELECT a.id FROM a WHERE EXISTS (SELECT 1 FROM (SELECT count(*) AS n, sum(b.v) AS s FROM b) AS t WHERE {})",
                     rng.pick(&["a.v > 4", "1 = 0", "t.n > 2", "a.v > t.s", "a.k IS NULL"])

@@ -14,6 +14,7 @@ pub mod csv;
 pub mod error;
 pub mod eval;
 pub mod exec;
+pub mod join_order;
 pub mod lexer;
 pub mod optimizer;
 pub mod parser;

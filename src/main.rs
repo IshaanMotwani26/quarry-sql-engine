@@ -277,9 +277,12 @@ impl Session {
             }
             if self.show_explain {
                 let plan = plan_query(&bound.query);
-                let optimized = self.options.optimize;
-                let plan = if optimized { optimize(plan) } else { plan };
-                print!("{}", plan.explain_with(&bound.columns, optimized));
+                let catalog = self.options.optimize.then_some(&self.catalog);
+                let plan = match catalog {
+                    Some(catalog) => optimize(plan, catalog),
+                    None => plan,
+                };
+                print!("{}", plan.explain_with(&bound.columns, catalog));
             }
             let start = Instant::now();
             match execute_with(&self.catalog, &bound, self.options) {
