@@ -1,20 +1,23 @@
 //! Rule-based optimizer: rewrites a logical plan into an equivalent, cheaper
-//! one. Four passes run in order:
+//! one. Five passes run in order:
 //!
-//! 1. **Constant folding** evaluates expressions that read no columns, once,
+//! 1. **Decorrelation** (`decorrelate.rs`) turns `EXISTS`, `NOT EXISTS`, and
+//!    `IN` subqueries in filters into semi and anti joins, so they run once
+//!    instead of once per row.
+//! 2. **Constant folding** evaluates expressions that read no columns, once,
 //!    at plan time: `DATE '1998-12-01' - INTERVAL '90' DAY` becomes
 //!    `DATE '1998-09-02'`, and `0.06 - 0.01` becomes `0.05`. It also
 //!    simplifies boolean logic (`x AND TRUE` is `x`; `x AND FALSE` is FALSE)
 //!    and drops filters that are always TRUE.
-//! 2. **Filter pushdown** moves each filter condition as far down the plan as
+//! 3. **Filter pushdown** moves each filter condition as far down the plan as
 //!    it can legally go, so rows are discarded before they're joined,
 //!    grouped, or sorted. A condition on one table lands directly above that
 //!    table's scan; a condition spanning both sides of an inner join becomes
 //!    part of that join (where it can become a hash-join key).
-//! 3. **Join ordering** (`join_order.rs`) picks the order of each chain of
+//! 4. **Join ordering** (`join_order.rs`) picks the order of each chain of
 //!    inner joins using row-count estimates, and builds each hash table on
 //!    the smaller input.
-//! 4. **Projection pruning** works top-down to find which columns each node's
+//! 5. **Projection pruning** works top-down to find which columns each node's
 //!    parent actually reads, and removes the rest. Scans then copy only the
 //!    columns the query uses out of storage.
 //!
@@ -28,6 +31,7 @@ use std::convert::Infallible;
 use crate::ast::{BinaryOp, JoinKind};
 use crate::bound::{BoundExpr, ColumnId, ExprKind};
 use crate::catalog::Catalog;
+use crate::decorrelate::decorrelate;
 use crate::eval::{eval, Layout, NoSubqueries, Scope};
 use crate::join_order::reorder_joins;
 use crate::plan::{columns_of, conjoin, contains_subquery, split_conjuncts, Plan};
@@ -35,6 +39,7 @@ use crate::types::Value;
 
 /// Runs all optimizer passes. The catalog supplies table statistics.
 pub fn optimize(plan: Plan, catalog: &Catalog) -> Plan {
+    let plan = decorrelate(plan);
     let plan = map_exprs(plan, &fold);
     let plan = push_down(plan, Vec::new());
     let plan = reorder_joins(plan, catalog);

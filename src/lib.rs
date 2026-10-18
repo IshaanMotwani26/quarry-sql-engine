@@ -11,6 +11,7 @@ pub mod bound;
 pub mod cardinality;
 pub mod catalog;
 pub mod csv;
+pub mod decorrelate;
 pub mod error;
 pub mod eval;
 pub mod exec;

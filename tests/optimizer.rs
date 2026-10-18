@@ -312,12 +312,106 @@ fn filters_move_through_derived_tables() {
 }
 
 #[test]
-fn correlated_subquery_filters_reach_the_inner_scan() {
+fn filters_inside_a_correlated_subquery_reach_its_scan() {
+    // Not decorrelatable (the subquery aggregates), so it still runs per row,
+    // but its own filters, including the outer reference, still move down.
+    let c = demo();
+    let sql = "SELECT id FROM a WHERE (SELECT count(*) FROM b WHERE b.k = a.k AND b.v > 3) > 0 ORDER BY 1";
+    assert_contains(
+        &explain(&c, sql),
+        "Filter ((b.k = a.k) AND (b.v > 3))\nScan b",
+    );
+    assert_eq!(rows(&c, sql), [["1"], ["4"], ["5"]]);
+}
+
+// ---------------------------------------------------------------------------
+// Subquery decorrelation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn exists_becomes_a_semi_join() {
     let c = demo();
     let sql =
         "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.v > 3) ORDER BY 1";
-    assert_contains(&explain(&c, sql), "Filter ((b.k = a.k) AND (b.v > 3))\n");
+    let plan = explain(&c, sql);
+    assert_contains(&plan, "HashSemiJoin keys=[a.k = b.k]");
+    // The subquery's own condition filters b before the join.
+    assert_contains(&plan, "Filter (b.v > 3)\nScan b");
+    assert!(!plan.contains("$sub"), "{plan}");
     assert_eq!(rows(&c, sql), [["1"], ["4"], ["5"]]);
+}
+
+#[test]
+fn not_exists_becomes_an_anti_join() {
+    let c = generated(0.002);
+    let plan = explain(&c, tpch::Q22);
+    assert_contains(
+        &plan,
+        "HashAntiJoin keys=[customer.c_custkey = orders.o_custkey]",
+    );
+    assert!(!plan.contains("(correlated)"), "{plan}");
+    // The uncorrelated scalar subquery (the average balance) stays a subquery.
+    assert!(plan.contains("$sub0:"), "{plan}");
+}
+
+#[test]
+fn in_subqueries_become_semi_joins() {
+    let c = demo();
+    let sql = "SELECT id FROM a WHERE k IN (SELECT k FROM b WHERE v > 3) ORDER BY 1";
+    assert_contains(&explain(&c, sql), "HashSemiJoin keys=[a.k = b.k]");
+    assert_eq!(rows(&c, sql), [["1"], ["4"], ["5"]]);
+    // The select expression may itself read the outer row.
+    let sql = "SELECT id FROM a WHERE v IN (SELECT b.v + a.k - 10 FROM b) ORDER BY 1";
+    assert!(explain(&c, sql).contains("SemiJoin"));
+    rows(&c, sql);
+}
+
+#[test]
+fn not_in_is_left_as_a_subquery() {
+    // With a NULL in b.k, NOT IN is never TRUE; an anti join would return rows.
+    let c = demo();
+    let sql = "SELECT id FROM a WHERE k NOT IN (SELECT k FROM b)";
+    assert!(explain(&c, sql).contains("NOT IN $sub0"));
+    assert!(rows(&c, sql).is_empty());
+}
+
+#[test]
+fn subqueries_that_aggregate_or_limit_stay_correlated() {
+    let c = demo();
+    for sql in [
+        "SELECT id FROM a WHERE EXISTS (SELECT count(*) FROM b WHERE b.k = a.k)",
+        "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k LIMIT 1)",
+    ] {
+        assert!(explain(&c, sql).contains("(correlated)"), "{sql}");
+        rows(&c, sql);
+    }
+}
+
+#[test]
+fn subqueries_whose_from_clause_reads_the_outer_row_stay_correlated() {
+    // The derived table x needs a's row, but a join's right input runs once,
+    // with no outer row, so this subquery must keep running per row of a.
+    let c = demo();
+    let sql = "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM (SELECT b.id FROM b WHERE b.k = a.k) AS x) ORDER BY 1";
+    assert!(explain(&c, sql).contains("(correlated)"));
+    assert_eq!(rows(&c, sql), [["1"], ["4"], ["5"]]);
+}
+
+#[test]
+fn subqueries_whose_inner_subquery_reads_the_outer_row_are_still_joined() {
+    let c = demo();
+    // The innermost EXISTS reads a.v, two levels out. Its condition becomes
+    // part of the semi join's condition, which sees both a's and b's rows, so
+    // the middle subquery can still be decorrelated; the innermost one runs
+    // per candidate pair instead of per (a row, b row).
+    let sql = "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND EXISTS \
+               (SELECT 1 FROM b AS c WHERE c.v > a.v AND c.id = b.id)) ORDER BY 1";
+    let plan = explain(&c, sql);
+    assert_contains(
+        &plan,
+        "HashSemiJoin keys=[a.k = b.k] residual=[EXISTS $sub0]",
+    );
+    assert_eq!(rows(&c, sql), [["1"], ["4"]]);
 }
 
 // ---------------------------------------------------------------------------
@@ -575,7 +669,7 @@ fn random_queries_give_identical_results_with_and_without_the_optimizer() {
         for _ in 0..8 {
             let kind = rng.pick(&["INNER", "LEFT", "RIGHT", "FULL"]);
             let (on, w1, w2) = (rng.pick(&preds), rng.pick(&preds), rng.pick(&preds));
-            let sql = match rng.below(8) {
+            let sql = match rng.below(10) {
                 0 => format!("SELECT a.id, b.id FROM a {kind} JOIN b ON {on} WHERE {w1} AND {w2}"),
                 1 => format!("SELECT a.id, b.id FROM a, b WHERE {w1} AND {w2}"),
                 2 => format!(
@@ -595,10 +689,20 @@ fn random_queries_give_identical_results_with_and_without_the_optimizer() {
                     "SELECT a.id FROM a WHERE EXISTS (SELECT 1 FROM (SELECT count(*) AS n, sum(b.v) AS s FROM b) AS t WHERE {})",
                     rng.pick(&["a.v > 4", "1 = 0", "t.n > 2", "a.v > t.s", "a.k IS NULL"])
                 ),
+                7 => format!(
+                    "SELECT a.id FROM a WHERE a.{} {} (SELECT b.{} FROM b WHERE {}) AND {}",
+                    rng.pick(&["k", "v"]),
+                    rng.pick(&["IN", "NOT IN"]),
+                    rng.pick(&["k", "v"]),
+                    rng.pick(&["b.v > 3", "b.v < a.v", "b.k = a.k", "1 = 1"]),
+                    rng.pick(&["a.v > 2", "1 = 1"])
+                ),
                 _ => format!(
-                    "SELECT a.id FROM a WHERE {} (SELECT 1 FROM b WHERE b.k = a.k AND {})",
+                    "SELECT a.id FROM a WHERE {} (SELECT 1 FROM b WHERE {} AND {}) AND {}",
                     rng.pick(&["EXISTS", "NOT EXISTS"]),
-                    rng.pick(&["b.v > 3", "b.v < a.v", "1 = 1"])
+                    rng.pick(&["b.k = a.k", "b.v = a.v", "b.v > a.v", "b.k = a.k + 0"]),
+                    rng.pick(&["b.v > 3", "b.v < a.v", "1 = 1", "b.k IS NULL"]),
+                    rng.pick(&["a.v > 2", "1 = 1", "a.k IS NOT NULL"])
                 ),
             };
             rows(&c, &sql);

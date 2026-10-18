@@ -166,7 +166,7 @@ pub fn plan_query(q: &BoundQuery) -> Plan {
     plan
 }
 
-fn plan_table_ref(t: &BoundTableRef) -> Plan {
+pub(crate) fn plan_table_ref(t: &BoundTableRef) -> Plan {
     match t {
         BoundTableRef::Base { table, columns } => Plan::Scan {
             table: table.clone(),
