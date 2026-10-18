@@ -163,6 +163,24 @@ impl<'a> Estimator<'a> {
                     JoinKind::Full => inner.max(l + r),
                 }
             }
+            Plan::SemiJoin {
+                left,
+                right,
+                on,
+                anti,
+            } => {
+                // Each left row is kept at most once: the matching fraction
+                // for a semi join, the rest for an anti join.
+                let (l, r) = (self.rows(left), self.rows(right));
+                let (lc, rc) = (column_set(left), column_set(right));
+                let conds = on.iter().flat_map(|e| split_conjuncts(e.clone()));
+                let matched = self.join_rows(l, r, &lc, &rc, conds).min(l);
+                if *anti {
+                    (l - matched).max(l * 0.1)
+                } else {
+                    matched
+                }
+            }
         };
         rows.max(1.0)
     }

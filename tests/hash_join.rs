@@ -4,7 +4,7 @@
 use quarry::catalog::{Catalog, Schema, Table};
 use quarry::csv::{parse_csv, CsvOptions};
 use quarry::types::{Type, Value};
-use quarry::{bind, execute_with, parse_query, ExecOptions};
+use quarry::{bind, execute_plan, execute_with, parse_query, plan_query, ExecOptions, Plan};
 
 fn catalog(tables: &[(&str, &str)]) -> Catalog {
     let mut c = Catalog::new();
@@ -259,6 +259,134 @@ fn random_joins_agree_with_nested_loop() {
                     &format!("SELECT a.id, b.id FROM a {kind} JOIN b ON {on}"),
                 );
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Semi and anti joins. Built by hand here (the optimizer doesn't produce them
+// yet) and checked against the same query written with EXISTS / NOT EXISTS,
+// which runs as a correlated subquery.
+// ---------------------------------------------------------------------------
+
+/// Plans `SELECT a.id FROM a JOIN b ON <cond>`, then turns the join into a
+/// semi (or anti) join: a's rows with (or without) a match in b.
+fn semi_join_plan(c: &Catalog, cond: &str, anti: bool) -> (Plan, quarry::bound::Bound) {
+    let q = parse_query(&format!("SELECT a.id FROM a JOIN b ON {cond}")).unwrap();
+    let b = bind(c, &q).unwrap();
+    let Plan::Project { input, exprs } = plan_query(&b.query) else {
+        panic!("expected a Project")
+    };
+    let Plan::Join {
+        left, right, on, ..
+    } = *input
+    else {
+        panic!("expected a Join")
+    };
+    (
+        Plan::Project {
+            input: Box::new(Plan::SemiJoin {
+                left,
+                right,
+                on,
+                anti,
+            }),
+            exprs,
+        },
+        b,
+    )
+}
+
+/// Checks a semi/anti join against [NOT] EXISTS, with and without hashing.
+fn check_semi_join(c: &Catalog, cond: &str, anti: bool) -> Vec<Value> {
+    let (plan, _) = semi_join_plan(c, cond, anti);
+    let not = if anti { "NOT " } else { "" };
+    let sql = format!("SELECT a.id FROM a WHERE {not}EXISTS (SELECT 1 FROM b WHERE {cond})");
+    let q = parse_query(&sql).unwrap();
+    let b = bind(c, &q).unwrap();
+    let expected = execute_with(c, &b, ExecOptions::default()).unwrap().rows;
+    for hash_join in [true, false] {
+        let got = execute_plan(
+            c,
+            &plan,
+            ExecOptions {
+                hash_join,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(got, expected, "{sql} (hash_join = {hash_join})");
+    }
+    expected.into_iter().map(|mut r| r.remove(0)).collect()
+}
+
+#[test]
+fn semi_join_keeps_each_matching_row_once() {
+    let c = catalog(&[("a", A), ("b", B)]);
+    // a.1 and a.4 (k = 10) each match two rows of b but appear once.
+    assert_eq!(
+        check_semi_join(&c, "a.k = b.k", false),
+        [Value::Int64(1), Value::Int64(4)]
+    );
+}
+
+#[test]
+fn anti_join_keeps_rows_without_a_match_including_null_keys() {
+    let c = catalog(&[("a", A), ("b", B)]);
+    // a.3 has a NULL key: it matches nothing, so NOT EXISTS keeps it.
+    assert_eq!(
+        check_semi_join(&c, "a.k = b.k", true),
+        [Value::Int64(2), Value::Int64(3)]
+    );
+}
+
+#[test]
+fn semi_joins_with_residuals_and_without_keys() {
+    let c = catalog(&[("a", A), ("b", B)]);
+    // The residual a.id > 2 rules out a.1, which matches b on the key alone.
+    let int = Value::Int64;
+    assert_eq!(
+        check_semi_join(&c, "a.k = b.k AND a.id > 2", false),
+        [int(4)]
+    );
+    assert_eq!(
+        check_semi_join(&c, "a.k = b.k AND a.id > 2", true),
+        [int(1), int(2), int(3)]
+    );
+    // No equality: falls back to trying every right row.
+    check_semi_join(&c, "a.id + 6 < b.id", false);
+    check_semi_join(&c, "a.id + 6 < b.id", true);
+}
+
+#[test]
+fn semi_join_explain_text() {
+    let c = catalog(&[("a", A), ("b", B)]);
+    let (plan, b) = semi_join_plan(&c, "a.k = b.k AND b.id > 8", true);
+    assert!(plan
+        .explain(&b.columns)
+        .contains("HashAntiJoin keys=[a.k = b.k] residual=[(b.id > 8)]"));
+    let (plan, b) = semi_join_plan(&c, "a.id < b.id", false);
+    assert!(plan
+        .explain(&b.columns)
+        .contains("NestedLoopSemiJoin on (a.id < b.id)"));
+}
+
+#[test]
+fn random_semi_and_anti_joins_agree_with_exists() {
+    let mut rng = Rng(0x5E31_A471_0000_0001);
+    let conditions = [
+        "a.k1 = b.k1",
+        "a.k1 = b.k1 AND a.k2 = b.k2",
+        "a.k1 = b.k1 AND a.v < b.v",
+        "a.v > b.v",
+    ];
+    for _ in 0..200 {
+        let mut c = Catalog::new();
+        c.register(random_table(&mut rng, "a")).unwrap();
+        c.register(random_table(&mut rng, "b")).unwrap();
+        for cond in conditions {
+            check_semi_join(&c, cond, false);
+            check_semi_join(&c, cond, true);
         }
     }
 }

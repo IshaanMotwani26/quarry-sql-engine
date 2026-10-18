@@ -114,6 +114,18 @@ fn reorder(est: &Estimator, plan: Plan) -> Plan {
             limit,
             offset,
         },
+        // Semi and anti joins aren't commutative; only their inputs are reordered.
+        Plan::SemiJoin {
+            left,
+            right,
+            on,
+            anti,
+        } => Plan::SemiJoin {
+            left: rec(left),
+            right: rec(right),
+            on,
+            anti,
+        },
         p @ (Plan::Scan { .. } | Plan::SingleRow) => p,
     }
 }

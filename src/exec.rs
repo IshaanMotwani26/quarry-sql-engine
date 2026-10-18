@@ -83,6 +83,18 @@ pub fn execute_with(catalog: &Catalog, bound: &Bound, options: ExecOptions) -> R
     })
 }
 
+/// Runs an already-built plan as-is (no optimizer) and returns its rows.
+/// Mainly for tests that construct plans directly.
+pub fn execute_plan(catalog: &Catalog, plan: &Plan, options: ExecOptions) -> Result<Vec<Row>> {
+    let exec = Executor::new(catalog, options);
+    let mut op = exec.build(plan)?;
+    let mut rows = Vec::new();
+    while let Some(row) = op.next(&exec, None)? {
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
 /// Holds per-execution state: the catalog and caches for subquery plans and
 /// uncorrelated subquery results.
 ///
@@ -223,6 +235,36 @@ impl<'c> Executor<'c> {
                 aggregates,
                 output: Vec::new().into_iter(),
             }),
+            Plan::SemiJoin {
+                left,
+                right,
+                on,
+                anti,
+            } => {
+                let (left_ids, right_ids) = (left.output(), right.output());
+                let split = match on {
+                    Some(on) if self.options.hash_join => {
+                        Some(join_keys(on, &left_ids, &right_ids))
+                    }
+                    _ => None,
+                }
+                .filter(|s| !s.keys.is_empty());
+                let mut combined = left_ids.clone();
+                combined.extend(&right_ids);
+                Box::new(SemiJoin {
+                    left_layout: Layout::new(&left_ids),
+                    right_layout: Layout::new(&right_ids),
+                    layout: Layout::new(&combined),
+                    left: self.build(left)?,
+                    right: Some(self.build(right)?),
+                    on: on.as_ref(),
+                    split,
+                    anti: *anti,
+                    table: HashMap::new(),
+                    right_rows: Vec::new(),
+                    left_width: left_ids.len(),
+                })
+            }
             Plan::Distinct { input } => Box::new(Distinct {
                 input: self.build(input)?,
                 seen: HashSet::new(),
@@ -588,6 +630,99 @@ impl Operator for HashJoin<'_> {
                 return Ok(Some(row));
             }
         }
+    }
+}
+
+/// Semi join (`anti: false`): emits each left row that has at least one
+/// matching right row, once. Anti join (`anti: true`): emits each left row
+/// with no match. The right input is read once up front. With equality keys,
+/// matches are found through a hash table, as in `HashJoin`; otherwise every
+/// right row is tried. A left row stops at its first match, so duplicates on
+/// the right never multiply the output.
+///
+/// As in SQL, a NULL key matches nothing, so under `NOT EXISTS` a left row
+/// whose key is NULL is always emitted.
+struct SemiJoin<'p> {
+    left: Box<dyn Operator + 'p>,
+    right: Option<Box<dyn Operator + 'p>>,
+    /// The whole condition, used when there are no hash keys.
+    on: Option<&'p BoundExpr>,
+    split: Option<JoinKeys<'p>>,
+    anti: bool,
+    left_layout: Layout,
+    right_layout: Layout,
+    layout: Layout,
+    table: HashMap<Vec<KeyValue>, Vec<usize>>,
+    right_rows: Vec<Row>,
+    left_width: usize,
+}
+
+impl SemiJoin<'_> {
+    fn build_side(
+        &mut self,
+        mut right: Box<dyn Operator + '_>,
+        exec: &Executor<'_>,
+        outer: Option<&Scope<'_>>,
+    ) -> Result<()> {
+        while let Some(row) = right.next(exec, outer)? {
+            if let Some(split) = &self.split {
+                let scope = Scope::new(&self.right_layout, &row, outer);
+                if let Some(key) = eval_keys(split.keys.iter().map(|(_, r)| *r), &scope, exec)? {
+                    self.table
+                        .entry(key)
+                        .or_default()
+                        .push(self.right_rows.len());
+                }
+            }
+            self.right_rows.push(row);
+        }
+        Ok(())
+    }
+
+    /// Whether `row` (a left row) has a match on the right.
+    fn has_match(&self, row: &Row, exec: &Executor<'_>, outer: Option<&Scope<'_>>) -> Result<bool> {
+        let (candidates, conditions): (Vec<usize>, &[&BoundExpr]) = match &self.split {
+            Some(split) => {
+                let scope = Scope::new(&self.left_layout, row, outer);
+                let key = eval_keys(split.keys.iter().map(|(l, _)| *l), &scope, exec)?;
+                let candidates = key
+                    .and_then(|k| self.table.get(&k).cloned())
+                    .unwrap_or_default();
+                (candidates, &split.residual)
+            }
+            None => ((0..self.right_rows.len()).collect(), self.on.as_slice()),
+        };
+        let mut combined = row.clone();
+        for i in candidates {
+            combined.truncate(self.left_width);
+            combined.extend(self.right_rows[i].iter().cloned());
+            let scope = Scope::new(&self.layout, &combined, outer);
+            let mut all = true;
+            for c in conditions {
+                if !eval_predicate(c, &scope, exec)? {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+impl Operator for SemiJoin<'_> {
+    fn next(&mut self, exec: &Executor<'_>, outer: Option<&Scope<'_>>) -> Result<Option<Row>> {
+        if let Some(right) = self.right.take() {
+            self.build_side(right, exec, outer)?;
+        }
+        while let Some(row) = self.left.next(exec, outer)? {
+            if self.has_match(&row, exec, outer)? != self.anti {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
     }
 }
 

@@ -25,6 +25,6 @@ pub mod types;
 pub use binder::{bind, BindError};
 pub use error::ParseError;
 pub use eval::ExecError;
-pub use exec::{execute, execute_with, ExecOptions, QueryResult};
+pub use exec::{execute, execute_plan, execute_with, ExecOptions, QueryResult};
 pub use parser::{parse_query, parse_statements};
 pub use plan::{plan_query, Plan};

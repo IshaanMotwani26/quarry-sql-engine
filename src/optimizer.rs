@@ -195,6 +195,17 @@ fn map_exprs(plan: Plan, f: &dyn Fn(BoundExpr) -> BoundExpr) -> Plan {
             limit,
             offset,
         },
+        Plan::SemiJoin {
+            left,
+            right,
+            on,
+            anti,
+        } => Plan::SemiJoin {
+            left: rec(left),
+            right: rec(right),
+            on: on.map(f).filter(|e| !is_true(e)),
+            anti,
+        },
     }
 }
 
@@ -330,6 +341,12 @@ fn push_down(plan: Plan, preds: Vec<BoundExpr>) -> Plan {
             kind,
             on,
         } => push_into_join(*left, *right, kind, on, preds),
+        Plan::SemiJoin {
+            left,
+            right,
+            on,
+            anti,
+        } => push_into_semi_join(*left, *right, on, anti, preds),
     }
 }
 
@@ -393,6 +410,36 @@ fn push_into_join(
         on,
     };
     wrap(join, stay)
+}
+
+/// A semi or anti join outputs only left rows, unchanged, so every condition
+/// above it can move into the left input. Of its own conditions, one on the
+/// right input alone can move into the right input (right rows failing it
+/// can never match). One on the left alone can move into the left input only
+/// for a semi join: an anti join must still emit the left rows that fail it.
+fn push_into_semi_join(
+    left: Plan,
+    right: Plan,
+    on: Option<BoundExpr>,
+    anti: bool,
+    preds: Vec<BoundExpr>,
+) -> Plan {
+    let l: HashSet<ColumnId> = left.output().into_iter().collect();
+    let r: HashSet<ColumnId> = right.output().into_iter().collect();
+    let (mut to_left, mut to_right, mut keep_on) = (preds, Vec::new(), Vec::new());
+    for c in on.map(split_conjuncts).unwrap_or_default() {
+        match side(&c, &l, &r) {
+            Side::Right => to_right.push(c),
+            Side::Left | Side::Neither if !anti => to_left.push(c),
+            _ => keep_on.push(c),
+        }
+    }
+    Plan::SemiJoin {
+        left: Box::new(push_down(left, to_left)),
+        right: Box::new(push_down(right, to_right)),
+        on: conjoin(keep_on),
+        anti,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -517,6 +564,23 @@ fn prune(plan: Plan, required: &HashSet<ColumnId>) -> Plan {
             limit,
             offset,
         },
+        Plan::SemiJoin {
+            left,
+            right,
+            on,
+            anti,
+        } => {
+            let need = union(
+                required,
+                on.as_ref().map(required_columns).unwrap_or_default(),
+            );
+            Plan::SemiJoin {
+                left: Box::new(prune(*left, &need)),
+                right: Box::new(prune(*right, &need)),
+                on,
+                anti,
+            }
+        }
     }
 }
 

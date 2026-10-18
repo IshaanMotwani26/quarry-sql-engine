@@ -36,6 +36,7 @@ fn spine(plan: &Plan) -> Vec<&'static str> {
             Plan::Distinct { .. } => "Distinct",
             Plan::Sort { .. } => "Sort",
             Plan::Limit { .. } => "Limit",
+            Plan::SemiJoin { .. } => "SemiJoin",
         });
         match node.children().first() {
             Some(child) => node = child,

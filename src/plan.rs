@@ -78,6 +78,15 @@ pub enum Plan {
         limit: Option<u64>,
         offset: u64,
     },
+    /// Keeps the left rows that have at least one match on the right (or,
+    /// with `anti`, no match). Output is the left columns only. This is how
+    /// `EXISTS`, `NOT EXISTS`, and `IN` subqueries run once decorrelated.
+    SemiJoin {
+        left: Box<Plan>,
+        right: Box<Plan>,
+        on: Option<BoundExpr>,
+        anti: bool,
+    },
 }
 
 /// Builds the logical plan for a bound query. Its output columns are exactly
@@ -403,7 +412,8 @@ impl Plan {
             Plan::Filter { input, .. }
             | Plan::Distinct { input }
             | Plan::Sort { input, .. }
-            | Plan::Limit { input, .. } => input.output(),
+            | Plan::Limit { input, .. }
+            | Plan::SemiJoin { left: input, .. } => input.output(),
             Plan::Project { exprs, .. } => exprs.iter().map(|(id, _)| *id).collect(),
             Plan::Join { left, right, .. } => {
                 let mut out = left.output();
@@ -431,7 +441,9 @@ impl Plan {
             | Plan::Distinct { input }
             | Plan::Sort { input, .. }
             | Plan::Limit { input, .. } => vec![input],
-            Plan::Join { left, right, .. } => vec![left, right],
+            Plan::Join { left, right, .. } | Plan::SemiJoin { left, right, .. } => {
+                vec![left, right]
+            }
         }
     }
 
@@ -455,6 +467,37 @@ fn line(out: &mut String, indent: usize, text: &str) {
     out.push_str(&"  ".repeat(indent));
     out.push_str(text);
     out.push('\n');
+}
+
+/// Explain text for a join: its hash keys and residual when it has
+/// equality keys, otherwise the nested-loop condition.
+fn describe_join<'a>(
+    hash_name: &str,
+    loop_name: &str,
+    on: Option<&'a BoundExpr>,
+    left: &Plan,
+    right: &Plan,
+    cols: &[ColumnInfo],
+    subs: &mut Vec<&'a BoundQuery>,
+) -> String {
+    match on.map(|on| join_keys(on, &left.output(), &right.output())) {
+        Some(JoinKeys { keys, residual }) if !keys.is_empty() => {
+            let keys: Vec<String> = keys
+                .iter()
+                .map(|(l, r)| format!("{} = {}", fmt_expr(cols, l, subs), fmt_expr(cols, r, subs)))
+                .collect();
+            let mut text = format!("{hash_name} keys=[{}]", keys.join(", "));
+            if !residual.is_empty() {
+                let parts: Vec<String> = residual.iter().map(|r| fmt_expr(cols, r, subs)).collect();
+                text += &format!(" residual=[{}]", parts.join(", "));
+            }
+            text
+        }
+        _ => match on {
+            Some(on) => format!("{loop_name} on {}", fmt_expr(cols, on, subs)),
+            None => loop_name.to_string(),
+        },
+    }
 }
 
 fn explain_into(
@@ -525,38 +568,32 @@ fn explain_into(
                 JoinKind::Full => "Full",
                 JoinKind::Cross => "Cross",
             };
-            let split = on
-                .as_ref()
-                .map(|on| join_keys(on, &left.output(), &right.output()));
-            match split {
-                Some(JoinKeys { keys, residual }) if !keys.is_empty() => {
-                    let keys: Vec<String> = keys
-                        .iter()
-                        .map(|(l, r)| {
-                            format!(
-                                "{} = {}",
-                                fmt_expr(cols, l, &mut subs),
-                                fmt_expr(cols, r, &mut subs)
-                            )
-                        })
-                        .collect();
-                    let mut text = format!("HashJoin {kind} keys=[{}]", keys.join(", "));
-                    if !residual.is_empty() {
-                        let parts: Vec<String> = residual
-                            .iter()
-                            .map(|r| fmt_expr(cols, r, &mut subs))
-                            .collect();
-                        text += &format!(" residual=[{}]", parts.join(", "));
-                    }
-                    text
-                }
-                _ => match on {
-                    Some(on) => {
-                        format!("NestedLoopJoin {kind} on {}", fmt_expr(cols, on, &mut subs))
-                    }
-                    None => format!("NestedLoopJoin {kind}"),
-                },
-            }
+            describe_join(
+                &format!("HashJoin {kind}"),
+                &format!("NestedLoopJoin {kind}"),
+                on.as_ref(),
+                left,
+                right,
+                cols,
+                &mut subs,
+            )
+        }
+        Plan::SemiJoin {
+            left,
+            right,
+            on,
+            anti,
+        } => {
+            let kind = if *anti { "Anti" } else { "Semi" };
+            describe_join(
+                &format!("Hash{kind}Join"),
+                &format!("NestedLoop{kind}Join"),
+                on.as_ref(),
+                left,
+                right,
+                cols,
+                &mut subs,
+            )
         }
         Plan::Aggregate {
             group_by,
