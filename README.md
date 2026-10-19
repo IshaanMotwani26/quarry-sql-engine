@@ -1,6 +1,6 @@
 # Quarry
 
-A vectorized SQL query engine written from scratch in Rust, with no dependencies. It runs TPC-H queries on generated data with a rule-based optimizer, hash joins, and hash aggregation.
+A vectorized SQL query engine written from scratch in Rust, with no dependencies. It runs TPC-H queries on generated data with a cost-based optimizer (join ordering, subquery decorrelation, filter pushdown), hash joins, and hash aggregation.
 
 ```
 SQL text → lexer → parser → AST → binder → logical plan → optimizer → executor → vectorized execution
@@ -10,7 +10,7 @@ SQL text → lexer → parser → AST → binder → logical plan → optimizer 
 ## Quick start
 
 ```bash
-cargo test            # 176 tests: parser, binder, planner, optimizer, evaluator, joins, aggregation, TPC-H
+cargo test            # 196 tests: parser, binder, planner, optimizer, evaluator, joins, aggregation, TPC-H
 cargo run --release   # REPL; \? lists commands, \demo loads sample tables
 ```
 
@@ -39,14 +39,14 @@ Limit 10
   Sort revenue DESC NULLS FIRST, o_orderdate ASC NULLS LAST
     Project l_orderkey, revenue := sum(l_extendedprice * (1 - l_discount)), o_orderdate, o_shippriority
       Aggregate keys=[lineitem.l_orderkey, orders.o_orderdate, orders.o_shippriority] aggs=[...]
-        HashJoin Inner keys=[orders.o_orderkey = lineitem.l_orderkey]
-          HashJoin Inner keys=[customer.c_custkey = orders.o_custkey]
-            Filter (customer.c_mktsegment = 'BUILDING')
-              Scan customer [2/8 columns: c_custkey, c_mktsegment]
-            Filter (orders.o_orderdate < DATE '1995-03-15')
-              Scan orders [4/9 columns: o_orderkey, o_custkey, o_orderdate, o_shippriority]
+        HashJoin Inner keys=[lineitem.l_orderkey = orders.o_orderkey]
           Filter (lineitem.l_shipdate > DATE '1995-03-15')
             Scan lineitem [4/16 columns: l_orderkey, l_extendedprice, l_discount, l_shipdate]
+          HashJoin Inner keys=[orders.o_custkey = customer.c_custkey]
+            Filter (orders.o_orderdate < DATE '1995-03-15')
+              Scan orders [4/9 columns: o_orderkey, o_custkey, o_orderdate, o_shippriority]
+            Filter (customer.c_mktsegment = 'BUILDING')
+              Scan customer [2/8 columns: c_custkey, c_mktsegment]
  l_orderkey |      revenue       | o_orderdate | o_shippriority
 ------------+--------------------+-------------+----------------
       13166 |        337532.7514 | 1995-02-14  |              0
@@ -127,10 +127,39 @@ Doubling the data roughly doubles the hash join's time and quadruples the nested
 
 Q8 gains the most: filtering `part` before its cross product with `supplier` shrinks that product about 150-fold. Q22 is dominated by a correlated `NOT EXISTS` that re-runs once per customer, which no rule here changes; that's subquery decorrelation, in 5b.
 
+## Phase 5b: Join ordering and subquery decorrelation (complete)
+
+- **Statistics** (`src/catalog.rs`): row counts, plus per-column distinct and NULL counts, computed on first use and cached until the table is replaced.
+- **Cardinality estimation** (`src/cardinality.rs`): estimates each plan node's output size from those statistics, using standard heuristics (`col = literal` keeps 1/distinct of the rows, an equi-join produces `|L|·|R| / max(distinct keys)`).
+- **Join ordering** (`src/join_order.rs`): flattens each chain of inner joins and orders it greedily. It starts from the smallest input and repeatedly adds the connected input that keeps the intermediate result smallest, keeping the written order when that's estimated cheaper. Every hash join, outer joins included, builds its table on the smaller input; `a LEFT JOIN b` becomes `b RIGHT JOIN a` when b is bigger. Q8 no longer has a cross product: it starts from the single `AMERICA` region row and follows foreign keys outward.
+- **Semi and anti joins** (`src/exec.rs`): a semi join keeps each left row that has a match, once; an anti join keeps each left row without one. Both are hash-based when there's an equality key.
+- **Decorrelation** (`src/decorrelate.rs`): `EXISTS`, `NOT EXISTS`, and `IN` subqueries in WHERE and HAVING become semi and anti joins, with the subquery's correlated conditions as the join condition. They run once instead of once per outer row. The rewrite is skipped when it wouldn't be exactly equivalent: `NOT IN` (whose NULL behavior an anti join doesn't model), subqueries that aggregate or use LIMIT, and subqueries whose FROM clause reads the outer row.
+- **Tests**: optimizer-on-vs-off comparisons now treat results without ORDER BY as multisets, since join reordering legitimately changes row order. Semi and anti joins are checked against `EXISTS`/`NOT EXISTS` on 200 random table pairs. Each decorrelation safety rule has a test that fails without it. Two findings came out of this work. A test caught that outer joins weren't getting the smaller build side (Q13 built its hash table on `orders` instead of `customer`). Mutation testing then showed one decorrelation restriction was unnecessary: a subquery nested inside a correlated condition can still see the outer row from within the join condition, so that case is now decorrelated too.
+
+**Phase 5a vs 5b**, TPC-H scale 0.05, release build, best of 3:
+
+| Query | 5a | 5b | Speedup |
+|---|---|---|---|
+| Q3 | 164 ms | 107 ms | 1.5× |
+| Q8 | 345 ms | 132 ms | 2.6× |
+| Q13 | 189 ms | 174 ms | 1.1× |
+| Q22 | 40,137 ms | 76 ms | ~525× |
+
+**The whole optimizer**, off vs on (same setup):
+
+| Query | Off | On | Speedup |
+|---|---|---|---|
+| Q1 | 371 ms | 305 ms | 1.2× |
+| Q3 | 1,207 ms | 107 ms | 11× |
+| Q6 | 173 ms | 70 ms | 2.5× |
+| Q8 | 10,816 ms | 132 ms | 82× |
+| Q13 | 305 ms | 174 ms | 1.8× |
+| Q22 | 41,694 ms | 76 ms | ~550× |
+
 ## Known limitations
 
 - **DECIMAL is stored as DOUBLE.** TPC-H's prices and discounts are exact decimals. In binary floating point, `0.06 + 0.01` is `0.06999…`, so Q6's `l_discount BETWEEN 0.05 AND 0.07` drops every 7% discount that a real database would keep. An exact decimal type is needed before Phase 8 can validate against the official TPC-H answers.
-- **Join order follows the FROM clause** (Q8 still has a small `part × supplier` cross product), and **correlated subqueries re-run per outer row** (Q22 is quadratic). Phase 5b adds join reordering and decorrelation.
+- **The optimizer's search is simple.** Join orders are left-deep and chosen greedily, not by exhaustive search, and estimates come from distinct counts, not histograms. Scalar subqueries and subqueries that aggregate still run once per outer row.
 - **Tables live in memory only** and disappear when the REPL exits; on-disk storage comes with the Parquet reader (7a).
 
 ## Roadmap
@@ -139,7 +168,7 @@ Q8 gains the most: filtering `part` before its cross product with `supplier` shr
 - [x] **2. Catalog + binder**: schemas, name resolution, type checking, CSV loading
 - [x] **3. Planner + executor**: 3a logical planner and expression evaluator; 3b Volcano executor (first end-to-end queries)
 - [x] **4. Aggregation + hash join**: 4a hash aggregation; 4b hash join and TPC-H data generator
-- [ ] **5. Optimizer**: 5a constant folding, filter pushdown, projection pruning (done); 5b join reordering, subquery decorrelation
+- [x] **5. Optimizer**: 5a constant folding, filter pushdown, projection pruning; 5b statistics, join ordering, subquery decorrelation
 - [ ] **6. Vectorized execution**: 6a columnar batches and vectorized expressions; 6b vectorized operators, benchmarked against the Volcano baseline
 - [ ] **7. Interop**: 7a Parquet reader; 7b Postgres wire protocol (connect with `psql` and psycopg)
 - [ ] **8. Evaluation**: 8a TPC-H SF1 benchmarks vs SQLite/DuckDB; 8b differential testing against DuckDB
