@@ -1,5 +1,5 @@
 use quarry::catalog::{Catalog, Schema, Table};
-use quarry::csv::{parse_csv, CsvOptions};
+use quarry::csv::{parse_csv, write_csv, CsvOptions};
 use quarry::tpch;
 use quarry::types::{parse_date, Type, Value};
 
@@ -147,4 +147,37 @@ fn column_stats_are_refreshed_when_a_table_is_replaced() {
     assert_eq!(c.column_stats("t", 0).unwrap().distinct, 2);
     c.register_or_replace(csv("a\n1\n2\n3\n4\n").unwrap());
     assert_eq!(c.column_stats("t", 0).unwrap().distinct, 4);
+}
+
+#[test]
+fn written_csv_reads_back_identically() {
+    let text = "id,name,price,day,ok\n1,\"comma, inside\",2.5,2024-02-29,true\n2,\"say \"\"hi\"\"\",,1999-12-31,\n3,\"\",0.1,,false\n4,\"two\nlines\",-7,2000-01-01,t\n";
+    let original = csv(text).unwrap();
+    for has_header in [true, false] {
+        let opts = CsvOptions {
+            delimiter: ',',
+            has_header,
+        };
+        let mut out = Vec::new();
+        write_csv(&original, &mut out, &opts).unwrap();
+        let written = String::from_utf8(out).unwrap();
+        let back = parse_csv("t", &written, &opts, Some(&original.schema)).unwrap();
+        assert_eq!(back, original, "round trip changed the table:\n{written}");
+    }
+}
+
+#[test]
+fn csv_export_uses_the_requested_delimiter() {
+    let t = csv("a,b\n1,x|y\n").unwrap();
+    let mut out = Vec::new();
+    write_csv(
+        &t,
+        &mut out,
+        &CsvOptions {
+            delimiter: '|',
+            has_header: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(String::from_utf8(out).unwrap(), "1|\"x|y\"\n");
 }

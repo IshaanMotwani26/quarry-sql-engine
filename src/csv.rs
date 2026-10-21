@@ -5,6 +5,7 @@
 //! - A trailing delimiter (TPC-H `.tbl` style: `1|foo|`) is ignored.
 //! - Header names are lowercased, matching SQL's case folding.
 
+use std::io::{self, Write};
 use std::path::Path;
 
 use crate::catalog::{Field, Schema, Table};
@@ -200,6 +201,37 @@ fn split_records(text: &str, delim: char) -> Result<Vec<Record>, String> {
         finish_record(&mut fields, record_line);
     }
     Ok(records)
+}
+
+/// Writes a table as CSV, the inverse of `parse_csv`: NULL is an empty
+/// unquoted field, an empty string is `""`, and fields containing the
+/// delimiter, a quote, or a line break are quoted with `""` escapes.
+pub fn write_csv(table: &Table, out: &mut impl Write, opts: &CsvOptions) -> io::Result<()> {
+    let delim = opts.delimiter.to_string();
+    let field = |s: &str| {
+        if s.is_empty() || s.contains([opts.delimiter, '"', '\n', '\r']) {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            s.to_string()
+        }
+    };
+    if opts.has_header {
+        let names: Vec<String> = table.schema.fields.iter().map(|f| field(&f.name)).collect();
+        writeln!(out, "{}", names.join(&delim))?;
+    }
+    for i in 0..table.row_count() {
+        let cells: Vec<String> = table
+            .row(i)
+            .iter()
+            .map(|v| match v {
+                Value::Null => String::new(),
+                Value::Utf8(s) => field(s),
+                other => other.to_string(),
+            })
+            .collect();
+        writeln!(out, "{}", cells.join(&delim))?;
+    }
+    Ok(())
 }
 
 fn parse_bool(s: &str) -> Option<bool> {
