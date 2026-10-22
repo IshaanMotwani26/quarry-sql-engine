@@ -2,7 +2,8 @@
 name = "quarry"
 version = "0.1.0"
 edition = "2021"
-description = "A vectorized SQL query engine written from scratch"
+description = "A SQL query engine written from scratch"
+default-run = "quarry"
 
 [lib]
 path = "src/lib.rs"
@@ -10,5 +11,9 @@ path = "src/lib.rs"
 [[bin]]
 name = "quarry"
 path = "src/main.rs"
+
+[[bin]]
+name = "quarry-bench"
+path = "src/bin/bench.rs"
 
 [dependencies]
