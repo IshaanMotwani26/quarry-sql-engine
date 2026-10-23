@@ -1,8 +1,7 @@
 //! Quarry: a SQL query engine built from scratch.
 //!
-//! Pipeline (completed phases in bold):
-//! **SQL text -> lexer -> parser -> AST -> binder -> logical plan -> rule-based
-//! optimizer -> row-at-a-time execution** -> vectorized execution
+//! Pipeline: SQL text -> lexer -> parser -> AST -> binder -> logical plan ->
+//! optimizer -> row-at-a-time execution.
 
 pub mod agg;
 pub mod ast;

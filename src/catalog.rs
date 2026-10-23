@@ -1,8 +1,9 @@
 //! Catalog and in-memory storage.
 //!
 //! Tables are stored column-by-column (one typed vector per column) rather
-//! than row-by-row. Phase 3 reads them a row at a time, but Phase 6's
-//! vectorized executor can scan these vectors directly.
+//! than row-by-row, so a scan copies only the columns a query reads. The
+//! executor works a row at a time; a vectorized executor could scan these
+//! vectors directly.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};

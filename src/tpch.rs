@@ -223,7 +223,7 @@ pub const QUERIES: &[(u32, &str)] = &[(1, Q1), (3, Q3), (6, Q6), (8, Q8), (13, Q
 //
 // Text fields (names, addresses, comments) are shorter and less varied than
 // dbgen's, and orderkeys are dense rather than sparse. Results therefore
-// won't match the official answer set; Phase 8 loads real dbgen output.
+// won't match the official answer set.
 
 const REGIONS: [&str; 5] = ["AFRICA", "AMERICA", "ASIA", "EUROPE", "MIDDLE EAST"];
 
