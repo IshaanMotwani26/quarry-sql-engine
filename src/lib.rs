@@ -17,6 +17,7 @@ pub mod exec;
 pub mod join_order;
 pub mod lexer;
 pub mod optimizer;
+pub mod parquet;
 pub mod parser;
 pub mod plan;
 pub mod tpch;
