@@ -1,9 +1,10 @@
 //! Parquet reading, checked against fixtures written by pyarrow (see
 //! tests/data/make_parquet.py).
 
+use quarry::catalog::Table;
 use quarry::parquet::meta::{Logical, Physical};
-use quarry::parquet::read_metadata;
-use quarry::types::Type;
+use quarry::parquet::{read_metadata, read_parquet};
+use quarry::types::{parse_date, Type, Value};
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = format!("{}/tests/data/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -90,4 +91,117 @@ fn rejects_files_it_cannot_read() {
         .schema()
         .unwrap_err();
     assert_eq!(err, "column t: TIMESTAMP values are not supported");
+}
+
+fn load(name: &str) -> Table {
+    read_parquet("t", &fixture(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+/// The rows of TYPES in make_parquet.py.
+fn expected_types_rows() -> Vec<Vec<Value>> {
+    use Value::{Boolean as B, Float64 as F, Int64 as I, Null as N};
+    let s = |x: &str| Value::Utf8(x.into());
+    let d = |x: &str| Value::Date(parse_date(x).unwrap());
+    vec![
+        vec![
+            I(1),
+            I(10),
+            B(true),
+            F(1.5),
+            F(0.5),
+            s("apple"),
+            d("2024-02-29"),
+            F(12.34),
+            I(1),
+        ],
+        vec![
+            I(2),
+            N,
+            B(false),
+            F(-0.25),
+            F(1.25),
+            s(""),
+            d("1970-01-01"),
+            F(-0.05),
+            I(-128),
+        ],
+        vec![I(3), I(-3), N, N, F(-2.0), N, d("1969-12-31"), N, I(127)],
+        vec![
+            I(4),
+            I(2147483647),
+            B(true),
+            F(1e10),
+            N,
+            s("naïve café"),
+            N,
+            F(9999999999.99),
+            N,
+        ],
+        vec![
+            I(5),
+            I(0),
+            B(true),
+            F(0.1),
+            F(0.0),
+            s("apple"),
+            d("1998-12-01"),
+            F(0.0),
+            I(0),
+        ],
+        vec![
+            I(6),
+            N,
+            B(false),
+            F(3.0),
+            F(8.0),
+            s("a,b|c"),
+            d("2000-01-01"),
+            F(1.1),
+            I(5),
+        ],
+    ]
+}
+
+#[test]
+fn reads_every_type_and_null() {
+    // Same data three ways: PLAIN values, dictionary-encoded values, and
+    // version 2 data pages.
+    for name in ["plain.parquet", "dictionary.parquet", "page_v2.parquet"] {
+        let t = load(name);
+        assert_eq!(t.row_count(), 6, "{name}");
+        let rows: Vec<Vec<Value>> = (0..6).map(|i| t.row(i)).collect();
+        assert_eq!(rows, expected_types_rows(), "{name}");
+    }
+}
+
+#[test]
+fn reads_many_pages_and_row_groups() {
+    // 3 row groups, small pages, and a dictionary that overflows partway so
+    // column k switches from dictionary to PLAIN pages.
+    let t = load("pages.parquet");
+    assert_eq!(t.row_count(), 1200);
+    for i in 0..1200 {
+        let s = if i % 11 == 0 {
+            Value::Null
+        } else {
+            Value::Utf8(format!("s{}", i % 13))
+        };
+        let expected = vec![
+            Value::Int64(i as i64),
+            Value::Int64(i as i64 % 7),
+            s,
+            Value::Boolean(i % 3 == 0),
+        ];
+        assert_eq!(t.row(i), expected, "row {i}");
+    }
+}
+
+#[test]
+fn rejects_corrupt_pages() {
+    let mut file = fixture("plain.parquet");
+    // Overwrite the start of the column data, just after the PAR1 header.
+    for b in &mut file[4..40] {
+        *b = 0xff;
+    }
+    assert!(read_parquet("t", &file).is_err());
 }
