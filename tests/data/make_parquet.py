@@ -79,6 +79,13 @@ def main():
           dictionary_pagesize_limit=512,  # k falls back to PLAIN mid-chunk
           write_batch_size=50)  # page limits are checked once per batch
 
+    # Snappy is the default codec for pyarrow, DuckDB, and Spark.
+    write("snappy.parquet", TYPES, compression="snappy")
+    write("snappy_v2.parquet", TYPES, compression="snappy", data_page_version="2.0")
+    write("snappy_pages.parquet", pages_table(), compression="snappy",
+          row_group_size=500, data_page_size=256, write_batch_size=50)
+    write("zstd.parquet", TYPES, compression="zstd")
+
     nested = pa.table({"id": [1], "point": [{"x": 1, "y": 2}]})
     write("nested.parquet", nested, compression="none")
     timestamps = pa.table({"t": pa.array([0], pa.timestamp("us"))})

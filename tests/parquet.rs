@@ -164,9 +164,15 @@ fn expected_types_rows() -> Vec<Vec<Value>> {
 
 #[test]
 fn reads_every_type_and_null() {
-    // Same data three ways: PLAIN values, dictionary-encoded values, and
-    // version 2 data pages.
-    for name in ["plain.parquet", "dictionary.parquet", "page_v2.parquet"] {
+    // Same data five ways: PLAIN values, dictionary-encoded values, version 2
+    // data pages, and Snappy-compressed version 1 and 2 pages.
+    for name in [
+        "plain.parquet",
+        "dictionary.parquet",
+        "page_v2.parquet",
+        "snappy.parquet",
+        "snappy_v2.parquet",
+    ] {
         let t = load(name);
         assert_eq!(t.row_count(), 6, "{name}");
         let rows: Vec<Vec<Value>> = (0..6).map(|i| t.row(i)).collect();
@@ -180,6 +186,7 @@ fn reads_many_pages_and_row_groups() {
     // column k switches from dictionary to PLAIN pages.
     let t = load("pages.parquet");
     assert_eq!(t.row_count(), 1200);
+    assert_eq!(load("snappy_pages.parquet"), t);
     for i in 0..1200 {
         let s = if i % 11 == 0 {
             Value::Null
@@ -204,4 +211,38 @@ fn rejects_corrupt_pages() {
         *b = 0xff;
     }
     assert!(read_parquet("t", &file).is_err());
+}
+
+#[test]
+fn names_unsupported_compression() {
+    let err = read_parquet("t", &fixture("zstd.parquet")).unwrap_err();
+    assert_eq!(
+        err,
+        "column id: ZSTD compression is not supported (only Snappy and uncompressed files are)"
+    );
+}
+
+#[test]
+fn corrupt_files_fail_cleanly() {
+    // Flip bytes throughout real files: every result must be a table or an
+    // error, never a panic.
+    for name in [
+        "plain.parquet",
+        "dictionary.parquet",
+        "snappy_pages.parquet",
+    ] {
+        let original = fixture(name);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..400 {
+            let mut file = original.clone();
+            for _ in 0..3 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let i = (seed % file.len() as u64) as usize;
+                file[i] ^= (seed >> 32) as u8 | 1;
+            }
+            let _ = read_parquet("t", &file);
+        }
+    }
 }

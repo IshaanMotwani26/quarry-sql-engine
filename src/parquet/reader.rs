@@ -10,6 +10,7 @@ use std::path::Path;
 
 use super::encoding::{bit_width, decode_hybrid, Plain};
 use super::meta::{read_metadata, ColumnChunk, ColumnSchema, Logical, Physical};
+use super::snappy;
 use super::thrift::{Reader, Struct};
 use crate::catalog::{Column, Table};
 use crate::types::Value;
@@ -95,7 +96,7 @@ fn read_chunk(
             }
             DATA_PAGE => {
                 let h = sub(&header, 5, "data page header")?;
-                let n = size(h.req_int(1, "page value count")?)?;
+                let n = page_values(h, chunk.num_values - seen)?;
                 let encoding = h.req_int(2, "page encoding")?;
                 let page = decompress(chunk.codec, body, uncompressed)?;
                 let (defined, used) = if schema.optional {
@@ -127,7 +128,7 @@ fn read_chunk(
             }
             DATA_PAGE_V2 => {
                 let h = sub(&header, 8, "data page v2 header")?;
-                let n = size(h.req_int(1, "page value count")?)?;
+                let n = page_values(h, chunk.num_values - seen)?;
                 let encoding = h.req_int(4, "page encoding")?;
                 let def_len = size(h.req_int(5, "definition levels length")?)?;
                 let rep_len = size(h.req_int(6, "repetition levels length")?)?;
@@ -168,6 +169,15 @@ fn sub<'a>(header: &'a Struct, id: i16, what: &str) -> Result<&'a Struct, String
         .ok_or_else(|| format!("corrupt Parquet file: missing {what}"))
 }
 
+/// A data page's value count, which can't exceed what the chunk has left.
+fn page_values(h: &Struct, left: i64) -> Result<usize, String> {
+    let n = h.req_int(1, "page value count")?;
+    if n > left {
+        return Err("corrupt Parquet file: page has more values than its column chunk".into());
+    }
+    size(n)
+}
+
 fn size(n: i64) -> Result<usize, String> {
     usize::try_from(n).map_err(|_| format!("corrupt Parquet file: negative size {n}"))
 }
@@ -179,10 +189,16 @@ fn decode_levels(data: &[u8], n: usize) -> Result<Vec<bool>, String> {
     Ok(levels.into_iter().map(|l| l == 1).collect())
 }
 
-fn decompress<'a>(codec: i64, data: &'a [u8], _size: usize) -> Result<Cow<'a, [u8]>, String> {
+fn decompress<'a>(codec: i64, data: &'a [u8], size: usize) -> Result<Cow<'a, [u8]>, String> {
     let name = match codec {
         0 => return Ok(Cow::Borrowed(data)),
-        1 => "SNAPPY",
+        1 => {
+            let out = snappy::decompress(data)?;
+            if out.len() != size {
+                return Err("corrupt Parquet page: wrong decompressed size".into());
+            }
+            return Ok(Cow::Owned(out));
+        }
         2 => "GZIP",
         3 => "LZO",
         4 => "BROTLI",
@@ -192,7 +208,7 @@ fn decompress<'a>(codec: i64, data: &'a [u8], _size: usize) -> Result<Cow<'a, [u
         _ => "unknown",
     };
     Err(format!(
-        "{name} compression is not supported (only uncompressed files are)"
+        "{name} compression is not supported (only Snappy and uncompressed files are)"
     ))
 }
 
