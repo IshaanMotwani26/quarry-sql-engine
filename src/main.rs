@@ -9,16 +9,18 @@ use std::path::Path;
 use std::time::Instant;
 
 use quarry::ast::Statement;
-use quarry::catalog::Catalog;
+use quarry::catalog::{Catalog, Table};
 use quarry::csv::{parse_csv, read_csv_file, CsvOptions};
 use quarry::exec::{execute_with, ExecOptions, QueryResult};
 use quarry::optimizer::optimize;
+use quarry::parquet::read_parquet_file;
 use quarry::types::{Type, Value};
 use quarry::{bind, parse_statements, plan_query, tpch, ParseError};
 
 const HELP: &str = "\
   \\load <table> <file> [delim]   load a CSV with a header row (types are inferred)
                                  delim: one character, or \\t for tab
+  \\load <table> <file.parquet>   load a Parquet file
   \\demo                          load small sample tables: emp, dept
   \\tpch                          register the 8 TPC-H tables (schemas only, no rows)
   \\tpch <scale>                  generate TPC-H data, e.g. \\tpch 0.01 (60k lineitem rows)
@@ -223,6 +225,10 @@ impl Session {
                 }
                 None => eprintln!("error: table \"{name}\" does not exist"),
             },
+            ["\\load", name, path] if path.to_ascii_lowercase().ends_with(".parquet") => {
+                let name = name.to_ascii_lowercase();
+                self.load(read_parquet_file(&name, Path::new(path)));
+            }
             ["\\load", name, path, rest @ ..] => {
                 let delimiter = match rest {
                     [] => ',',
@@ -237,22 +243,31 @@ impl Session {
                     delimiter,
                     has_header: true,
                 };
-                match read_csv_file(&name.to_ascii_lowercase(), Path::new(path), &opts, None) {
-                    Ok(table) => {
-                        println!(
-                            "loaded {} rows into {} {}",
-                            table.row_count(),
-                            table.name,
-                            table.schema
-                        );
-                        self.catalog.register_or_replace(table);
-                    }
-                    Err(e) => eprintln!("error: {e}"),
-                }
+                self.load(read_csv_file(
+                    &name.to_ascii_lowercase(),
+                    Path::new(path),
+                    &opts,
+                    None,
+                ));
             }
             _ => eprintln!("unknown command `{line}`; try \\?"),
         }
         true
+    }
+
+    fn load(&mut self, loaded: Result<Table, String>) {
+        match loaded {
+            Ok(table) => {
+                println!(
+                    "loaded {} rows into {} {}",
+                    table.row_count(),
+                    table.name,
+                    table.schema
+                );
+                self.catalog.register_or_replace(table);
+            }
+            Err(e) => eprintln!("error: {e}"),
+        }
     }
 
     fn run(&self, sql: &str) {

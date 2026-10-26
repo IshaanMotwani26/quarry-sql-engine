@@ -6,7 +6,7 @@ A SQL query engine written from scratch in Rust, with no dependencies. It parses
 SQL text → lexer → parser → binder → logical planner → optimizer → executor → results
 ```
 
-The optimizer pushes filters down, prunes unused columns, folds constants, turns `EXISTS`/`IN` subqueries into semi and anti joins, and orders joins by estimated cost from table statistics. The executor runs hash joins, hash aggregation, sorting, and correlated subqueries over columnar in-memory tables.
+The optimizer pushes filters down, prunes unused columns, folds constants, turns `EXISTS`/`IN` subqueries into semi and anti joins, and orders joins by estimated cost from table statistics. The executor runs hash joins, hash aggregation, sorting, and correlated subqueries over columnar in-memory tables, loaded from CSV or Parquet files.
 
 ## Results
 
@@ -36,18 +36,19 @@ Reproduce with `cargo run --release --bin quarry-bench -- 0.01 0.05 0.1 --runs 5
 
 ### How correctness is checked
 
-201 tests, run in CI with `clippy -D warnings` and `rustfmt`:
+223 tests, run in CI with `clippy -D warnings` and `rustfmt`:
 
 - **Property tests**: random syntax trees must print and reparse identically.
 - **Differential tests**: every query must return the same result with the optimizer on and off, and with hash and nested-loop joins (1,200 random queries plus all six TPC-H queries); semi and anti joins are checked against `EXISTS` on random tables.
 - **Reference implementations**: TPC-H Q1, Q3, and Q6 are recomputed directly in Rust and compared.
 - **Mutation testing**: deliberately planted bugs (wrong outer-join pushdown, NULL keys that match, a dropped join residual, and others) must each fail at least one test. This found two weak tests, which were strengthened, and one unnecessary optimizer restriction, which was removed.
 - **SQLite**: the benchmark fails if any answer differs.
+- **Parquet fixtures** written by pyarrow and DuckDB, plus thousands of randomly corrupted files that must fail with an error, never a crash.
 
 ## Quick start
 
 ```bash
-cargo test                               # 201 tests
+cargo test                               # 223 tests
 cargo run --release                      # REPL; \? lists commands, \demo loads sample tables
 cargo run --release --bin quarry-bench   # TPC-H benchmark against SQLite
 ```
@@ -203,6 +204,15 @@ Q8 gains the most: filtering `part` before its cross product with `supplier` shr
 - **CSV export** (`src/csv.rs`): the inverse of the loader, round-trip tested with quotes, delimiters, line breaks, NULLs, and empty strings.
 - **`quarry-bench`** (`src/bin/bench.rs`): generates TPC-H data, times each query in Quarry, exports the tables to an in-memory SQLite database (through the `sqlite3` tool, so Quarry stays dependency-free), runs SQLite-dialect versions of the same queries in two index setups, and compares every answer. See [Results](#results).
 
+### Phase 7a: Parquet reader
+
+Reads Parquet files with `\load <table> <file.parquet>`, with no Parquet library (`src/parquet/`):
+
+- **Thrift compact protocol decoder** (`thrift.rs`) for the file footer and page headers. It decodes into a generic tree keyed by field id, so it doesn't need code generated from Parquet's schema definition, and it skips fields it doesn't know.
+- **Page decoding** (`encoding.rs`, `reader.rs`): PLAIN and dictionary encodings, the RLE / bit-packing hybrid used for NULL flags and dictionary indices, and version 1 and 2 data pages, including chunks that switch from dictionary to PLAIN partway through.
+- **Snappy decompression** (`snappy.rs`), the default codec for pyarrow, DuckDB, and Spark, in about 100 lines.
+- **Types**: booleans, integers, floats, strings, dates, and decimals (loaded as DOUBLE). Nested columns, timestamps, and other codecs (ZSTD, GZIP) are rejected with an error naming the column. A million-row file written by DuckDB loads in under half a second.
+
 ## Known limitations
 
 - **DECIMAL is stored as DOUBLE.** TPC-H's prices and discounts are exact decimals. In binary floating point, `0.06 + 0.01` is `0.06999…`, so Q6's `l_discount BETWEEN 0.05 AND 0.07` drops every 7% discount that a real database would keep. SQLite stores these columns as doubles too, so the two engines agree, but both would differ from the official TPC-H answers.
@@ -215,6 +225,6 @@ Q8 gains the most: filtering `part` before its cross product with `supplier` shr
 
 - **Vectorized execution**: process columns in batches of ~1,000 values instead of one row at a time, the standard way to close SQLite's lead on Q3 and Q6.
 - **Exact DECIMAL type**, so results match the official TPC-H answers.
-- **Indexes and on-disk storage**, for example a Parquet reader.
+- **Indexes**, and saving tables to disk.
 - **Postgres wire protocol**, so `psql` and Postgres drivers can connect.
 - **More TPC-H queries**, and loading official `dbgen` data.

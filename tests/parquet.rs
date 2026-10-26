@@ -1,10 +1,13 @@
 //! Parquet reading, checked against fixtures written by pyarrow (see
 //! tests/data/make_parquet.py).
 
-use quarry::catalog::Table;
+use std::path::Path;
+
+use quarry::catalog::{Catalog, Table};
 use quarry::parquet::meta::{Logical, Physical};
-use quarry::parquet::{read_metadata, read_parquet};
+use quarry::parquet::{read_metadata, read_parquet, read_parquet_file};
 use quarry::types::{parse_date, Type, Value};
+use quarry::{bind, execute, parse_query};
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = format!("{}/tests/data/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -245,4 +248,52 @@ fn corrupt_files_fail_cleanly() {
             let _ = read_parquet("t", &file);
         }
     }
+}
+
+fn query(catalog: &Catalog, sql: &str) -> Vec<Vec<Value>> {
+    let q = parse_query(sql).unwrap();
+    let b = bind(catalog, &q).unwrap();
+    execute(catalog, &b).unwrap().rows
+}
+
+#[test]
+fn queries_a_file_written_by_duckdb() {
+    // DuckDB stores `half` as a fixed-length binary DECIMAL and `price` as an
+    // INT64 DECIMAL. Expected answers come from running the same queries in
+    // DuckDB.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/duckdb.parquet");
+    let mut catalog = Catalog::new();
+    catalog
+        .register(read_parquet_file("items", &path).unwrap())
+        .unwrap();
+    let d = |x: &str| Value::Date(parse_date(x).unwrap());
+    assert_eq!(
+        query(
+            &catalog,
+            "select count(*), count(half), sum(price), min(day), max(day), max(label), sum(half) \
+             from items where even"
+        ),
+        [[
+            Value::Int64(500),
+            Value::Int64(250),
+            Value::Float64(62625.0),
+            d("2024-01-03"),
+            d("2026-09-27"),
+            Value::Utf8("item4".into()),
+            Value::Float64(62500.0),
+        ]]
+    );
+    let by_label = query(
+        &catalog,
+        "select label, count(*), sum(price) from items group by label order by label",
+    );
+    let sums: Vec<f64> = by_label
+        .iter()
+        .map(|r| match r[2] {
+            Value::Float64(x) => x,
+            _ => panic!("{r:?}"),
+        })
+        .collect();
+    assert_eq!(sums, [25125.0, 24925.0, 24975.0, 25025.0, 25075.0]);
+    assert!(by_label.iter().all(|r| r[1] == Value::Int64(200)));
 }

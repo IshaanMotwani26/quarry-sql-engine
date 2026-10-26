@@ -86,6 +86,21 @@ def main():
           row_group_size=500, data_page_size=256, write_batch_size=50)
     write("zstd.parquet", TYPES, compression="zstd")
 
+    # A file from a second writer. DuckDB uses Snappy and its own choices of
+    # page layout and encodings.
+    import duckdb
+    duckdb.sql(f"""
+        COPY (
+            SELECT i AS id,
+                   'item' || (i % 5) AS label,
+                   CASE WHEN i % 4 = 0 THEN NULL ELSE i * 0.5 END AS half,
+                   DATE '2024-01-01' + i::INTEGER AS day,
+                   CAST(i / 4 AS DECIMAL(15, 2)) AS price,
+                   i % 2 = 0 AS even
+            FROM range(1, 1001) t(i)
+        ) TO '{os.path.join(HERE, "duckdb.parquet")}' (FORMAT parquet)
+    """)
+
     nested = pa.table({"id": [1], "point": [{"x": 1, "y": 2}]})
     write("nested.parquet", nested, compression="none")
     timestamps = pa.table({"t": pa.array([0], pa.timestamp("us"))})
