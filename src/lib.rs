@@ -19,6 +19,7 @@ pub mod lexer;
 pub mod optimizer;
 pub mod parquet;
 pub mod parser;
+pub mod pgwire;
 pub mod plan;
 pub mod tpch;
 pub mod types;

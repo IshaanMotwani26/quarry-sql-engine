@@ -5,9 +5,9 @@
 //! executor works a row at a time; a vectorized executor could scan these
 //! vectors directly.
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::sync::Mutex;
 
 use crate::agg::KeyValue;
 use crate::types::{Type, Value};
@@ -253,8 +253,9 @@ impl ColumnStats {
 pub struct Catalog {
     tables: BTreeMap<String, Table>,
     /// Column statistics, computed on first request and cached until the
-    /// table is replaced. Keyed by (table name, column index).
-    stats: RefCell<HashMap<(String, usize), ColumnStats>>,
+    /// table is replaced. Keyed by (table name, column index). A mutex rather
+    /// than a RefCell so one catalog can serve queries on several threads.
+    stats: Mutex<HashMap<(String, usize), ColumnStats>>,
 }
 
 impl Catalog {
@@ -272,7 +273,8 @@ impl Catalog {
 
     pub fn register_or_replace(&mut self, table: Table) {
         self.stats
-            .borrow_mut()
+            .get_mut()
+            .unwrap()
             .retain(|(name, _), _| *name != table.name);
         self.tables.insert(table.name.clone(), table);
     }
@@ -288,11 +290,13 @@ impl Catalog {
     /// Statistics for one column. The first call scans the column once.
     pub fn column_stats(&self, table: &str, column: usize) -> Option<ColumnStats> {
         let key = (table.to_string(), column);
-        if let Some(stats) = self.stats.borrow().get(&key) {
+        if let Some(stats) = self.stats.lock().unwrap().get(&key) {
             return Some(*stats);
         }
+        // Computed without holding the lock, so other threads aren't blocked
+        // on the scan; two threads may both compute the same stats, harmlessly.
         let stats = ColumnStats::compute(self.get(table)?.columns.get(column)?);
-        self.stats.borrow_mut().insert(key, stats);
+        self.stats.lock().unwrap().insert(key, stats);
         Some(stats)
     }
 }
