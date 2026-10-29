@@ -16,4 +16,8 @@ path = "src/main.rs"
 name = "quarry-bench"
 path = "src/bin/bench.rs"
 
+[[bin]]
+name = "quarry-server"
+path = "src/bin/server.rs"
+
 [dependencies]
