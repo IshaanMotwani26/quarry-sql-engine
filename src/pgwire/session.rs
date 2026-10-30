@@ -3,6 +3,7 @@
 use std::io;
 use std::sync::Arc;
 
+use super::extended::Extended;
 use super::protocol::{
     command_complete, empty_query_response, error_response, ready_for_query, Body, Message, Out,
     PgError,
@@ -31,12 +32,22 @@ pub struct Session {
     /// transaction block, b'E' in a block that hit an error. Quarry has no
     /// real transactions, but clients like psycopg wrap queries in BEGIN and
     /// COMMIT and check this status.
-    tx: u8,
+    pub(super) tx: u8,
+    /// Prepared statements and portals for the extended query protocol.
+    pub(super) ext: Extended,
 }
 
 impl Session {
     pub fn new(catalog: Arc<Catalog>) -> Self {
-        Session { catalog, tx: b'I' }
+        Session {
+            catalog,
+            tx: b'I',
+            ext: Extended::default(),
+        }
+    }
+
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
     }
 
     /// Answers one message. Returns false when the client asks to close the
@@ -48,6 +59,9 @@ impl Session {
                 self.simple_query(&sql, out);
             }
             b'X' => return Ok(false),
+            b'P' | b'B' | b'D' | b'E' | b'C' | b'H' | b'S' => {
+                self.extended(msg.tag, &msg.body, out)
+            }
             tag => {
                 let e = PgError::new(
                     "0A000",
@@ -144,7 +158,7 @@ pub fn run_query(catalog: &Catalog, sql: &str) -> Result<Outcome, PgError> {
     })
 }
 
-fn syntax_error(sql: &str, e: &ParseError) -> PgError {
+pub(super) fn syntax_error(sql: &str, e: &ParseError) -> PgError {
     // Convert the 1-based line and column to a 1-based character position.
     let before: usize = sql
         .split('\n')

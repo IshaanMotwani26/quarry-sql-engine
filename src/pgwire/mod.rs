@@ -5,6 +5,7 @@
 //! catalog. There is no authentication, so the server should only listen on
 //! localhost.
 
+pub mod extended;
 pub mod protocol;
 pub mod session;
 pub mod sql;

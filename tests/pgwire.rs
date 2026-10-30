@@ -221,3 +221,163 @@ fn serves_clients_concurrently() {
         h.join().unwrap();
     }
 }
+
+// Extended query protocol message builders.
+
+fn cstr(buf: &mut Vec<u8>, s: &str) {
+    buf.extend(s.as_bytes());
+    buf.push(0);
+}
+
+impl Client {
+    fn parse(&mut self, name: &str, sql: &str, types: &[i32]) {
+        let mut b = Vec::new();
+        cstr(&mut b, name);
+        cstr(&mut b, sql);
+        b.extend((types.len() as i16).to_be_bytes());
+        for t in types {
+            b.extend(t.to_be_bytes());
+        }
+        self.send(b'P', &b);
+    }
+
+    /// Binds text parameters, or binary ones if `binary` is set.
+    fn bind(&mut self, portal: &str, stmt: &str, params: &[Option<Vec<u8>>], binary: bool) {
+        let mut b = Vec::new();
+        cstr(&mut b, portal);
+        cstr(&mut b, stmt);
+        b.extend(1i16.to_be_bytes());
+        b.extend((binary as i16).to_be_bytes());
+        b.extend((params.len() as i16).to_be_bytes());
+        for p in params {
+            match p {
+                None => b.extend((-1i32).to_be_bytes()),
+                Some(v) => {
+                    b.extend((v.len() as i32).to_be_bytes());
+                    b.extend(v);
+                }
+            }
+        }
+        b.extend(0i16.to_be_bytes());
+        self.send(b'B', &b);
+    }
+
+    fn describe(&mut self, kind: u8, name: &str) {
+        let mut b = vec![kind];
+        cstr(&mut b, name);
+        self.send(b'D', &b);
+    }
+
+    fn execute(&mut self, portal: &str, max_rows: i32) {
+        let mut b = Vec::new();
+        cstr(&mut b, portal);
+        b.extend(max_rows.to_be_bytes());
+        self.send(b'E', &b);
+    }
+
+    fn sync(&mut self) -> Reply {
+        self.send(b'S', &[]);
+        self.read_reply()
+    }
+}
+
+fn text(s: &str) -> Option<Vec<u8>> {
+    Some(s.as_bytes().to_vec())
+}
+
+#[test]
+fn extended_query_with_parameters() {
+    let mut c = Client::connect(start_server());
+    c.parse(
+        "",
+        "select name, score from people where id >= $1 and name <> $2 order by id",
+        &[20, 0],
+    );
+    c.bind("", "", &[text("2"), text("it's")], false);
+    c.describe(b'P', "");
+    c.execute("", 0);
+    let r = c.sync();
+    assert_eq!(r.kinds, "12TDDCZ");
+    assert_eq!(
+        r.columns,
+        [("name".to_string(), 25), ("score".to_string(), 701)]
+    );
+    assert_eq!(cells(&r.rows), [["grace", "NULL"], ["linus", "7"]]);
+    assert_eq!(r.tags, ["SELECT 2"]);
+}
+
+#[test]
+fn binary_and_null_parameters() {
+    let mut c = Client::connect(start_server());
+    c.parse(
+        "q",
+        "select count(*), $2 is null from people where id > $1",
+        &[23, 25],
+    );
+    c.bind("", "q", &[Some(1i32.to_be_bytes().to_vec()), None], true);
+    c.execute("", 0);
+    let r = c.sync();
+    assert_eq!(cells(&r.rows), [["2", "t"]]);
+}
+
+#[test]
+fn execute_hands_out_rows_in_batches() {
+    let mut c = Client::connect(start_server());
+    c.parse("", "select id from people order by id", &[]);
+    c.bind("p", "", &[], false);
+    c.execute("p", 2);
+    c.execute("p", 2);
+    let r = c.sync();
+    // Two rows, PortalSuspended, then the last row and CommandComplete.
+    assert_eq!(r.kinds, "12DDsDCZ");
+    assert_eq!(cells(&r.rows), [["1"], ["2"], ["3"]]);
+}
+
+#[test]
+fn describing_a_statement_reports_parameters_and_columns() {
+    let mut c = Client::connect(start_server());
+    c.parse("s", "select id, name from people where score > $1", &[701]);
+    c.describe(b'S', "s");
+    let r = c.sync();
+    assert_eq!(r.kinds, "1tTZ");
+    assert_eq!(
+        r.columns,
+        [("id".to_string(), 20), ("name".to_string(), 25)]
+    );
+
+    // A named statement can be bound many times, then closed.
+    for (min, expected) in [("8", "1"), ("0", "2")] {
+        c.bind("", "s", &[text(min)], false);
+        c.execute("", 0);
+        assert_eq!(c.sync().rows.len().to_string(), expected);
+    }
+    let mut b = vec![b'S'];
+    cstr(&mut b, "s");
+    c.send(b'C', &b);
+    c.bind("", "s", &[text("1")], false);
+    let r = c.sync();
+    assert_eq!(r.kinds, "3EZ");
+    assert_eq!(r.errors[0].0, "26000");
+}
+
+#[test]
+fn errors_skip_to_the_next_sync() {
+    let mut c = Client::connect(start_server());
+    c.parse("", "selec 1", &[]);
+    c.bind("", "", &[], false);
+    c.execute("", 0);
+    let r = c.sync();
+    assert_eq!(r.kinds, "EZ", "only the error and ReadyForQuery");
+    assert_eq!(r.errors[0].0, "42601");
+
+    // The connection is usable again after Sync.
+    c.parse("", "select 1/0", &[]);
+    c.bind("", "", &[], false);
+    c.execute("", 0);
+    let r = c.sync();
+    assert_eq!(
+        (r.kinds.as_str(), r.errors[0].0.as_str()),
+        ("12EZ", "22012")
+    );
+    assert_eq!(c.query("select 7").rows, [[Some("7".to_string())]]);
+}
