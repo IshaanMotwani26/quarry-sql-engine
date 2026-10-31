@@ -6,7 +6,7 @@ A SQL query engine written from scratch in Rust, with no dependencies. It parses
 SQL text → lexer → parser → binder → logical planner → optimizer → executor → results
 ```
 
-The optimizer pushes filters down, prunes unused columns, folds constants, turns `EXISTS`/`IN` subqueries into semi and anti joins, and orders joins by estimated cost from table statistics. The executor runs hash joins, hash aggregation, sorting, and correlated subqueries over columnar in-memory tables, loaded from CSV or Parquet files.
+The optimizer pushes filters down, prunes unused columns, folds constants, turns `EXISTS`/`IN` subqueries into semi and anti joins, and orders joins by estimated cost from table statistics. The executor runs hash joins, hash aggregation, sorting, and correlated subqueries over columnar in-memory tables, loaded from CSV or Parquet files. A built-in Postgres wire protocol server lets `psql` and drivers like psycopg query it.
 
 ## Results
 
@@ -36,7 +36,7 @@ Reproduce with `cargo run --release --bin quarry-bench -- 0.01 0.05 0.1 --runs 5
 
 ### How correctness is checked
 
-223 tests, run in CI with `clippy -D warnings` and `rustfmt`:
+244 tests, run in CI with `clippy -D warnings` and `rustfmt`:
 
 - **Property tests**: random syntax trees must print and reparse identically.
 - **Differential tests**: every query must return the same result with the optimizer on and off, and with hash and nested-loop joins (1,200 random queries plus all six TPC-H queries); semi and anti joins are checked against `EXISTS` on random tables.
@@ -48,9 +48,10 @@ Reproduce with `cargo run --release --bin quarry-bench -- 0.01 0.05 0.1 --runs 5
 ## Quick start
 
 ```bash
-cargo test                               # 223 tests
+cargo test                               # 244 tests
 cargo run --release                      # REPL; \? lists commands, \demo loads sample tables
 cargo run --release --bin quarry-bench   # TPC-H benchmark against SQLite
+cargo run --release --bin quarry-server -- --tpch 0.01   # Postgres-compatible server on port 5433
 ```
 
 ```
@@ -213,6 +214,24 @@ Reads Parquet files with `\load <table> <file.parquet>`, with no Parquet library
 - **Snappy decompression** (`snappy.rs`), the default codec for pyarrow, DuckDB, and Spark, in about 100 lines.
 - **Types**: booleans, integers, floats, strings, dates, and decimals (loaded as DOUBLE). Nested columns, timestamps, and other codecs (ZSTD, GZIP) are rejected with an error naming the column. A million-row file written by DuckDB loads in under half a second.
 
+### Phase 7b: Postgres wire protocol
+
+`quarry-server` speaks version 3 of the Postgres protocol, so standard clients connect to Quarry as if it were Postgres (`src/pgwire/`):
+
+```
+$ cargo run --release --bin quarry-server -- --tpch 0.01 --load items=data.parquet
+$ psql -h localhost -p 5433
+quarry=> select l_returnflag, count(*) from lineitem group by l_returnflag order by l_returnflag;
+```
+
+- **Startup and simple queries** (`protocol.rs`, `session.rs`): declines SSL, reports server parameters, and answers each statement with typed column descriptions, text-format rows, and errors with SQLSTATE codes (`42P01` undefined table, `42601` syntax error with the character position psql uses to draw its caret, and so on).
+- **Extended query protocol** (`extended.rs`): Parse, Bind, Describe, Execute, Close, and Sync, with prepared statements, `$1` parameters in text or binary format (including Postgres's base-10000 binary NUMERIC), portals that hand out rows in batches, and discarding messages after an error until the next Sync. This is what psycopg and most drivers use for every query.
+- **Transactions as clients expect them**: Quarry is read-only, but `BEGIN`, `COMMIT`, `ROLLBACK`, and `SET` are accepted and the transaction status is tracked, including the failed state after an error, because drivers check it.
+- **One thread per connection** sharing one catalog. Making that possible meant replacing the catalog's statistics cache `RefCell` with a `Mutex`.
+- **Tested** by a protocol-level client in `tests/pgwire.rs`, and against real clients: psql 16 and psycopg 3 (`tests/clients/psycopg_check.py`).
+
+Listens on localhost only, since there is no authentication. psql's `\d` commands query Postgres's system catalogs, which Quarry doesn't have.
+
 ## Known limitations
 
 - **DECIMAL is stored as DOUBLE.** TPC-H's prices and discounts are exact decimals. In binary floating point, `0.06 + 0.01` is `0.06999…`, so Q6's `l_discount BETWEEN 0.05 AND 0.07` drops every 7% discount that a real database would keep. SQLite stores these columns as doubles too, so the two engines agree, but both would differ from the official TPC-H answers.
@@ -226,5 +245,4 @@ Reads Parquet files with `\load <table> <file.parquet>`, with no Parquet library
 - **Vectorized execution**: process columns in batches of ~1,000 values instead of one row at a time, the standard way to close SQLite's lead on Q3 and Q6.
 - **Exact DECIMAL type**, so results match the official TPC-H answers.
 - **Indexes**, and saving tables to disk.
-- **Postgres wire protocol**, so `psql` and Postgres drivers can connect.
 - **More TPC-H queries**, and loading official `dbgen` data.
