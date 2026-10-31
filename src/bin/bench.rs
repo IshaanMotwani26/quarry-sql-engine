@@ -1,24 +1,29 @@
-//! quarry-bench: runs the TPC-H queries on generated data, in Quarry and in
-//! SQLite, and compares both the timings and the answers.
+//! quarry-bench: runs the TPC-H queries on generated data, in Quarry, SQLite,
+//! and DuckDB, and compares both the timings and the answers.
 //!
 //!   cargo run --release --bin quarry-bench              # scales 0.01 and 0.05
-//!   cargo run --release --bin quarry-bench -- 0.1 --runs 5
-//!   cargo run --release --bin quarry-bench -- --no-sqlite
+//!   cargo run --release --bin quarry-bench -- 1 --runs 3
+//!   cargo run --release --bin quarry-bench -- --no-sqlite --no-duckdb
 //!
 //! Each query is parsed and bound once, then executed `--runs` times; the
 //! fastest run is reported, which filters out noise from the rest of the
 //! machine. Data generation and loading are not included.
 //!
-//! The SQLite comparison uses the `sqlite3` command-line tool (Quarry itself
-//! has no dependencies) and is skipped if it isn't installed. The generated
-//! tables are exported as CSV and loaded into an in-memory SQLite database
-//! (so both engines work from memory), with `ANALYZE` run. SQLite is timed in
-//! two setups: with each table's primary key only, and with indexes on the
-//! foreign keys as well. Quarry has no indexes at all, so the second setup
-//! shows what B-tree index lookups buy SQLite. The queries are SQLite-dialect versions of the same SQL
-//! (SQLite has no INTERVAL, EXTRACT, or derived-table column lists). Every
-//! result is compared row by row, which makes SQLite an independent check
-//! that Quarry's answers are right.
+//! The comparisons use the `sqlite3` and `duckdb` command-line tools (Quarry
+//! itself has no dependencies); each is skipped if it isn't installed. The
+//! generated tables are exported as CSV once and loaded into in-memory
+//! databases, so every engine works from memory.
+//!
+//! - SQLite runs with `ANALYZE`, in two setups: each table's primary key
+//!   only, and with indexes on the foreign keys as well. Quarry has no
+//!   indexes, so the second setup shows what B-tree lookups buy SQLite. The
+//!   queries are SQLite-dialect versions of the same SQL (SQLite has no
+//!   INTERVAL, EXTRACT, or derived-table column lists).
+//! - DuckDB, a vectorized columnar engine, runs Quarry's own SQL with one
+//!   thread (like Quarry and SQLite) and with all cores.
+//!
+//! Every result is compared row by row, so each engine is an independent
+//! check that Quarry's answers are right.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -35,6 +40,7 @@ struct Options {
     scales: Vec<f64>,
     runs: usize,
     sqlite: bool,
+    duckdb: bool,
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -42,6 +48,7 @@ fn parse_args() -> Result<Options, String> {
         scales: Vec::new(),
         runs: 3,
         sqlite: true,
+        duckdb: true,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -55,8 +62,11 @@ fn parse_args() -> Result<Options, String> {
                     .ok_or(format!("invalid --runs value `{n}`"))?;
             }
             "--no-sqlite" => opts.sqlite = false,
+            "--no-duckdb" => opts.duckdb = false,
             "-h" | "--help" => {
-                return Err("usage: quarry-bench [SCALE ...] [--runs N] [--no-sqlite]".into())
+                return Err(
+                    "usage: quarry-bench [SCALE ...] [--runs N] [--no-sqlite] [--no-duckdb]".into(),
+                )
             }
             scale => {
                 let s: f64 = scale
@@ -210,8 +220,8 @@ const FOREIGN_KEY_INDEXES: &[(&str, &str)] = &[
     ("nation", "n_regionkey"),
 ];
 
-fn sqlite_available() -> bool {
-    Command::new("sqlite3")
+fn available(program: &str) -> bool {
+    Command::new(program)
         .arg("--version")
         .output()
         .is_ok_and(|o| o.status.success())
@@ -244,43 +254,58 @@ fn sqlite_schema() -> String {
     ddl
 }
 
-/// One query's SQLite measurements.
-struct SqliteResult {
+/// One query's measurements from an external engine.
+struct EngineResult {
     query: u32,
     best_ms: f64,
-    /// Output cells as printed by sqlite3, from the first run.
+    /// Output cells as printed by the engine's shell, from the first run.
     rows: Vec<Vec<String>>,
 }
 
-/// Times each query in SQLite, optionally with foreign-key indexes.
-fn run_sqlite(
-    catalog: &Catalog,
-    runs: usize,
-    dir: &Path,
-    fk_indexes: bool,
-) -> Result<Vec<SqliteResult>, String> {
+/// Writes every TPC-H table to `dir` as a headerless CSV file.
+fn export_tables(catalog: &Catalog, dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let mut script = String::from(".bail on\n");
-    script += &sqlite_schema();
-    script += ".mode csv\n";
     let opts = CsvOptions {
         delimiter: ',',
         has_header: false,
     };
     for (table, _) in tpch::TABLES {
-        let path = dir.join(format!("{table}.csv"));
+        let path = csv_path(dir, table);
         let t = catalog.get(table).ok_or(format!("table {table} missing"))?;
-        let mut out =
-            BufWriter::new(File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?);
+        let mut out = BufWriter::new(File::create(&path).map_err(|e| format!("{path}: {e}"))?);
         write_csv(t, &mut out, &opts)
             .and_then(|_| out.flush())
             .map_err(|e| e.to_string())?;
-        // Forward slashes work on Windows too, and single quotes stop the
-        // shell from treating backslashes as escapes.
-        script += &format!(
-            ".import '{}' {table}\n",
-            path.display().to_string().replace('\\', "/")
-        );
+    }
+    Ok(())
+}
+
+/// Forward slashes work on Windows too, and both shells take them inside
+/// single quotes without treating backslashes as escapes.
+fn csv_path(dir: &Path, table: &str) -> String {
+    dir.join(format!("{table}.csv"))
+        .display()
+        .to_string()
+        .replace('\\', "/")
+}
+
+/// Appends each query `runs` times, each group after a marker line.
+fn append_queries(script: &mut String, queries: &[(u32, String)], runs: usize) {
+    for (query, sql) in queries {
+        *script += &format!(".print ===Q{query}===\n");
+        for _ in 0..runs {
+            *script += &format!("{sql};\n");
+        }
+    }
+}
+
+/// The sqlite3 script: schema, import, optional indexes, then the queries.
+fn sqlite_script(dir: &Path, runs: usize, fk_indexes: bool) -> String {
+    let mut script = String::from(".bail on\n");
+    script += &sqlite_schema();
+    script += ".mode csv\n";
+    for (table, _) in tpch::TABLES {
+        script += &format!(".import '{}' {table}\n", csv_path(dir, table));
     }
     if fk_indexes {
         for (table, column) in FOREIGN_KEY_INDEXES {
@@ -288,20 +313,92 @@ fn run_sqlite(
         }
     }
     script += "ANALYZE;\n.mode list\n.separator |\n.nullvalue NULL\n.timer on\n";
-    for (query, sql) in SQLITE_QUERIES {
-        script += &format!(".print ===Q{query}===\n");
-        for _ in 0..runs {
-            script += &format!("{sql};\n");
-        }
-    }
+    let queries: Vec<(u32, String)> = SQLITE_QUERIES
+        .iter()
+        .map(|(q, sql)| (*q, sql.to_string()))
+        .collect();
+    append_queries(&mut script, &queries, runs);
+    script
+}
 
-    let mut child = Command::new("sqlite3")
+// ---------------------------------------------------------------------------
+// DuckDB
+// ---------------------------------------------------------------------------
+
+/// CREATE TABLE statements with DuckDB's types.
+fn duckdb_schema() -> String {
+    let mut ddl = String::new();
+    for (table, columns) in tpch::TABLES {
+        let cols: Vec<String> = columns
+            .iter()
+            .map(|(name, ty)| {
+                let sql_type = match ty {
+                    Type::Int64 => "BIGINT",
+                    Type::Float64 => "DOUBLE",
+                    Type::Date => "DATE",
+                    _ => "VARCHAR",
+                };
+                format!("{name} {sql_type}")
+            })
+            .collect();
+        ddl += &format!("CREATE TABLE {table} ({});\n", cols.join(", "));
+    }
+    ddl
+}
+
+/// Quarry's own query text, with two changes for DuckDB:
+///
+/// - DuckDB doesn't accept the interval precision `day (3)` that the TPC-H
+///   spec writes.
+/// - DuckDB evaluates `0.06 - 0.01` as an exact DECIMAL (0.05), while Quarry
+///   computes it in floating point (0.049999...). The prices and discounts
+///   are stored as DOUBLE in both engines, so the literals are made DOUBLE
+///   too, or the engines would disagree about which discounts fall inside
+///   Q6's range.
+fn duckdb_queries() -> Vec<(u32, String)> {
+    tpch::QUERIES
+        .iter()
+        .map(|(q, sql)| {
+            let sql = sql
+                .replace("day (3)", "day")
+                .replace("0.06 - 0.01", "0.06::double - 0.01::double")
+                .replace("0.06 + 0.01", "0.06::double + 0.01::double");
+            (*q, sql)
+        })
+        .collect()
+}
+
+/// The duckdb script: schema, CSV load, thread count, then the queries.
+fn duckdb_script(dir: &Path, runs: usize, threads: usize) -> String {
+    let mut script = String::from(".bail on\n");
+    script += &duckdb_schema();
+    for (table, _) in tpch::TABLES {
+        script += &format!(
+            "COPY {table} FROM '{}' (FORMAT csv, HEADER false);\n",
+            csv_path(dir, table)
+        );
+    }
+    script += &format!("SET threads = {threads};\n");
+    script += ".mode list\n.separator |\n.nullvalue NULL\n.headers off\n.timer on\n";
+    append_queries(&mut script, &duckdb_queries(), runs);
+    script
+}
+
+// ---------------------------------------------------------------------------
+// Running an engine's shell
+// ---------------------------------------------------------------------------
+
+/// Pipes `script` into `program :memory:` and collects each query's rows and
+/// best time. `timer` is the prefix of the shell's timing lines: sqlite3
+/// prints "Run Time: real 0.012 ...", duckdb "Run Time (s): real 0.012 ...".
+fn run_shell(program: &str, script: &str, timer: &str) -> Result<Vec<EngineResult>, String> {
+    let mut child = Command::new(program)
         .arg(":memory:")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("could not start sqlite3: {e}"))?;
+        .map_err(|e| format!("could not start {program}: {e}"))?;
     child
         .stdin
         .take()
@@ -311,25 +408,29 @@ fn run_sqlite(
     let output = child.wait_with_output().map_err(|e| e.to_string())?;
     if !output.status.success() {
         return Err(format!(
-            "sqlite3 failed: {}",
+            "{program} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         ));
     }
+    parse_output(&String::from_utf8_lossy(&output.stdout), timer)
+}
 
-    // Output: a marker line per query, then each run's rows followed by a
-    // "Run Time: real <seconds> ..." line. Rows are kept from the first run.
-    let mut results: Vec<SqliteResult> = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+/// Output: a marker line per query, then each run's rows followed by a
+/// timing line. Rows are kept from the first run. Timing lines before the
+/// first marker (for loading and setup) are ignored.
+fn parse_output(stdout: &str, timer: &str) -> Result<Vec<EngineResult>, String> {
+    let mut results: Vec<EngineResult> = Vec::new();
+    for line in stdout.lines() {
         if let Some(q) = line
             .strip_prefix("===Q")
             .and_then(|l| l.strip_suffix("==="))
         {
-            results.push(SqliteResult {
+            results.push(EngineResult {
                 query: q.parse().map_err(|_| format!("bad marker {line}"))?,
                 best_ms: f64::INFINITY,
                 rows: Vec::new(),
             });
-        } else if let Some(rest) = line.strip_prefix("Run Time: real ") {
+        } else if let Some(rest) = line.strip_prefix(timer) {
             let secs: f64 = rest
                 .split_whitespace()
                 .next()
@@ -346,42 +447,34 @@ fn run_sqlite(
             }
         }
     }
-    let _ = std::fs::remove_dir_all(dir);
     Ok(results)
 }
 
-/// Whether a Quarry value and a SQLite output cell are the same answer.
+/// Whether a Quarry value and an engine's output cell are the same answer.
 /// Floats may differ in the last bits (sums can run in a different order).
-fn same_cell(quarry: &Value, sqlite: &str) -> bool {
+fn same_cell(quarry: &Value, other: &str) -> bool {
     match quarry {
-        Value::Null => sqlite == "NULL",
-        Value::Int64(x) => sqlite.parse::<f64>().is_ok_and(|y| y == *x as f64),
-        Value::Float64(x) => sqlite
+        Value::Null => other == "NULL",
+        Value::Int64(x) => other.parse::<f64>().is_ok_and(|y| y == *x as f64),
+        Value::Float64(x) => other
             .parse::<f64>()
             .is_ok_and(|y| (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0)),
-        other => other.to_string() == sqlite,
+        v => v.to_string() == other,
     }
 }
 
-fn same_result(quarry: &[Vec<Value>], sqlite: &[Vec<String>]) -> bool {
-    quarry.len() == sqlite.len()
+fn same_result(quarry: &[Vec<Value>], other: &[Vec<String>]) -> bool {
+    quarry.len() == other.len()
         && quarry
             .iter()
-            .zip(sqlite)
+            .zip(other)
             .all(|(q, s)| q.len() == s.len() && q.iter().zip(s).all(|(a, b)| same_cell(a, b)))
 }
 
-fn ratio(quarry_ms: f64, sqlite_ms: f64) -> String {
-    if sqlite_ms < 1.0 {
-        return "SQLite under 1 ms".into();
-    }
-    let r = sqlite_ms / quarry_ms;
-    if r >= 1.0 {
-        format!("Quarry {r:.1}x faster")
-    } else {
-        format!("SQLite {:.1}x faster", 1.0 / r)
-    }
-}
+/// Above this scale SQLite runs only with foreign-key indexes: without
+/// them its Q22 plan scans `orders` once per customer, which grows with the
+/// square of the scale (5 s per run at 0.1, minutes at 1).
+const SQLITE_KEYS_ONLY_MAX_SCALE: f64 = 0.1;
 
 fn main() -> ExitCode {
     let opts = match parse_args() {
@@ -394,6 +487,16 @@ fn main() -> ExitCode {
     if cfg!(debug_assertions) {
         eprintln!("warning: debug build; timings are ~10x slower. Use `cargo run --release --bin quarry-bench`.");
     }
+    let sqlite = opts.sqlite && available("sqlite3");
+    if opts.sqlite && !sqlite {
+        eprintln!("note: sqlite3 not found on PATH; skipping SQLite");
+    }
+    let duckdb = opts.duckdb && available("duckdb");
+    if opts.duckdb && !duckdb {
+        eprintln!("note: duckdb not found on PATH; skipping DuckDB");
+    }
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+
     for &scale in &opts.scales {
         let start = Instant::now();
         let mut catalog = Catalog::new();
@@ -403,74 +506,127 @@ fn main() -> ExitCode {
             "\n## TPC-H scale {scale} ({lineitems} lineitem rows, generated in {:.1} s)\n",
             start.elapsed().as_secs_f64()
         );
-        let results = match run_quarry(&catalog, opts.runs) {
+        let quarry = match run_quarry(&catalog, opts.runs) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("error: {e}");
                 return ExitCode::FAILURE;
             }
         };
-        let sqlite = if !opts.sqlite {
-            None
-        } else if !sqlite_available() {
-            eprintln!("note: sqlite3 not found on PATH; skipping the SQLite comparison");
-            None
-        } else {
+
+        // Each external engine: a column label and its results.
+        let mut engines: Vec<(String, Vec<EngineResult>)> = Vec::new();
+        if sqlite || duckdb {
             let dir = std::env::temp_dir().join(format!("quarry-bench-{}", std::process::id()));
-            let keys_only = run_sqlite(&catalog, opts.runs, &dir, false);
-            let indexed = run_sqlite(&catalog, opts.runs, &dir, true);
-            match keys_only.and_then(|k| indexed.map(|i| (k, i))) {
-                Ok(both) => Some(both),
+            let mut runs: Vec<(String, &str, String, &str)> = Vec::new();
+            if sqlite && scale <= SQLITE_KEYS_ONLY_MAX_SCALE {
+                let script = sqlite_script(&dir, opts.runs, false);
+                runs.push((
+                    "SQLite, primary keys".into(),
+                    "sqlite3",
+                    script,
+                    "Run Time: real ",
+                ));
+            }
+            if sqlite {
+                let script = sqlite_script(&dir, opts.runs, true);
+                runs.push((
+                    "SQLite, + FK indexes".into(),
+                    "sqlite3",
+                    script,
+                    "Run Time: real ",
+                ));
+            }
+            if duckdb {
+                for threads in [1, cores] {
+                    let label = match threads {
+                        1 => "DuckDB, 1 thread".to_string(),
+                        n => format!("DuckDB, {n} threads"),
+                    };
+                    let script = duckdb_script(&dir, opts.runs, threads);
+                    runs.push((label, "duckdb", script, "Run Time (s): real "));
+                    if cores == 1 {
+                        break;
+                    }
+                }
+            }
+            let result = export_tables(&catalog, &dir).and_then(|_| {
+                runs.into_iter()
+                    .map(|(label, program, script, timer)| {
+                        eprintln!("running {label}...");
+                        run_shell(program, &script, timer).map(|r| (label, r))
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            });
+            let _ = std::fs::remove_dir_all(&dir);
+            match result {
+                Ok(r) => engines = r,
                 Err(e) => {
                     eprintln!("error: {e}");
                     return ExitCode::FAILURE;
                 }
             }
-        };
-        match &sqlite {
-            None => {
-                println!("| Query | Result rows | Quarry (best of {}) |", opts.runs);
-                println!("|---|---|---|");
-                for m in &results {
-                    println!("| Q{} | {} | {:.1} ms |", m.query, m.rows.len(), m.best_ms);
+            if sqlite && scale > SQLITE_KEYS_ONLY_MAX_SCALE {
+                println!("(SQLite without foreign-key indexes is skipped above scale {SQLITE_KEYS_ONLY_MAX_SCALE}: its Q22 plan is quadratic.)\n");
+            }
+        }
+
+        let mut header = format!("| Query | Rows | Quarry (best of {})", opts.runs);
+        let mut rule = String::from("|---|---|---");
+        for (label, _) in &engines {
+            header += &format!(" | {label}");
+            rule += "|---";
+        }
+        if !engines.is_empty() {
+            header += " | Same answers";
+            rule += "|---";
+        }
+        println!("{header} |\n{rule}|");
+
+        let mut all_match = true;
+        for m in &quarry {
+            let mut line = format!("| Q{} | {} | {} ", m.query, m.rows.len(), ms(m.best_ms));
+            let mut same = true;
+            for (_, results) in &engines {
+                match results.iter().find(|r| r.query == m.query) {
+                    Some(r) => {
+                        same &= same_result(&m.rows, &r.rows);
+                        line += &format!("| {} ", ms(r.best_ms));
+                    }
+                    None => {
+                        same = false;
+                        line += "| missing ";
+                    }
                 }
             }
-            Some((keys_only, indexed)) => {
-                println!("| Query | Quarry | SQLite, primary keys | | SQLite, + foreign-key indexes | | Same answer |");
-                println!("|---|---|---|---|---|---|---|");
-                let mut all_match = true;
-                for m in &results {
-                    let find = |set: &[SqliteResult]| {
-                        set.iter()
-                            .find(|r| r.query == m.query)
-                            .map(|r| (r.best_ms, r.rows.clone()))
-                    };
-                    let (Some((keys_ms, keys_rows)), Some((idx_ms, idx_rows))) =
-                        (find(keys_only), find(indexed))
-                    else {
-                        continue;
-                    };
-                    let same = same_result(&m.rows, &keys_rows) && same_result(&m.rows, &idx_rows);
-                    all_match &= same;
-                    println!(
-                        "| Q{} | {:.1} ms | {:.1} ms | {} | {:.1} ms | {} | {} |",
-                        m.query,
-                        m.best_ms,
-                        keys_ms,
-                        ratio(m.best_ms, keys_ms),
-                        idx_ms,
-                        ratio(m.best_ms, idx_ms),
-                        if same { "yes" } else { "**NO**" }
-                    );
-                }
-                if !all_match {
-                    eprintln!("error: Quarry and SQLite disagree on at least one query");
-                    return ExitCode::FAILURE;
-                }
+            if !engines.is_empty() {
+                line += if same { "| yes " } else { "| **NO** " };
             }
+            all_match &= same;
+            println!("{line}|");
+        }
+        if !all_match {
+            eprintln!("error: the engines disagree on at least one query");
+            return ExitCode::FAILURE;
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Milliseconds with a thousands separator, e.g. "1,234 ms" or "5.2 ms".
+fn ms(x: f64) -> String {
+    if x < 100.0 {
+        return format!("{x:.1} ms");
+    }
+    let digits = format!("{:.0}", x);
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    format!("{out} ms")
 }
 
 #[cfg(test)]
@@ -495,6 +651,37 @@ mod tests {
         assert!(ddl.contains("l_shipdate TEXT"));
         assert!(ddl.contains("l_discount REAL"));
         assert!(ddl.contains("PRIMARY KEY (l_orderkey, l_linenumber)"));
+    }
+
+    #[test]
+    fn parses_shell_output() {
+        let out = "Run Time (s): real 0.500 user 0.1 sys 0\n===Q1===\nA|1.5\nB|NULL\n\
+                   Run Time (s): real 0.020 user 0 sys 0\nA|1.5\nB|NULL\n\
+                   Run Time (s): real 0.010 user 0 sys 0\n===Q6===\n42\n\
+                   Run Time (s): real 0.003 user 0 sys 0\n";
+        let r = parse_output(out, "Run Time (s): real ").unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!((r[0].query, r[0].best_ms), (1, 10.0));
+        assert_eq!(r[0].rows, [["A", "1.5"], ["B", "NULL"]]);
+        assert_eq!((r[1].query, r[1].rows.len()), (6, 1));
+    }
+
+    #[test]
+    fn duckdb_queries_use_double_literals() {
+        let q6 = &duckdb_queries()[2].1;
+        assert!(q6.contains("0.06::double - 0.01::double"), "{q6}");
+        assert!(!duckdb_queries()[0].1.contains("day (3)"));
+        assert_eq!(
+            duckdb_schema().matches("CREATE TABLE").count(),
+            tpch::TABLES.len()
+        );
+    }
+
+    #[test]
+    fn formats_milliseconds() {
+        assert_eq!(ms(5.25), "5.2 ms");
+        assert_eq!(ms(1234.4), "1,234 ms");
+        assert_eq!(ms(123.0), "123 ms");
     }
 
     #[test]
