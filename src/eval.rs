@@ -281,11 +281,19 @@ fn sql_eq(a: &Value, b: &Value) -> Option<bool> {
     }
 }
 
-/// `x IN (items)`: TRUE on a match; otherwise NULL if x or any item is NULL;
-/// otherwise FALSE. NOT IN negates that three-valued result.
+/// `x IN (items)`: TRUE on a match; FALSE if there are no items; otherwise
+/// NULL if x or any item is NULL; otherwise FALSE. NOT IN negates that
+/// three-valued result.
 fn in_values<'v>(x: &Value, items: impl Iterator<Item = &'v Value>, negated: bool) -> Value {
+    let mut items = items.peekable();
     let result = if x.is_null() {
-        Value::Null
+        // NULL IN (empty set) is false, not NULL: there is nothing to be
+        // unsure about. Found by differential testing against DuckDB.
+        if items.peek().is_none() {
+            Value::Boolean(false)
+        } else {
+            Value::Null
+        }
     } else {
         let mut saw_null = false;
         let mut found = false;

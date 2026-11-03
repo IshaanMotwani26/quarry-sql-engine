@@ -286,6 +286,30 @@ fn in_and_not_in_subqueries() {
 }
 
 #[test]
+fn null_in_an_empty_subquery_is_false() {
+    // NULL IN (no rows) is FALSE, and NULL NOT IN (no rows) is TRUE: with
+    // nothing to compare against, the NULL doesn't matter. Against a
+    // non-empty set the answer is unknown. Found by differential testing
+    // against DuckDB (tests/difftest/duckdb_diff.py).
+    assert_eq!(
+        rows(
+            "SELECT NULL IN (SELECT id FROM dept WHERE id > 100), \
+                    NULL NOT IN (SELECT id FROM dept WHERE id > 100), \
+                    NULL IN (SELECT id FROM dept)"
+        ),
+        [["false", "true", "NULL"]]
+    );
+    // Employees whose department differs from all of their reports'. Margaret
+    // has no department, but nobody reports to her, so her subquery is empty
+    // and NOT IN keeps her row.
+    assert_eq!(
+        col("SELECT name FROM emp e WHERE e.dept_id NOT IN \
+             (SELECT m.dept_id FROM emp m WHERE m.manager_id = e.id) ORDER BY e.id"),
+        ["Grace", "Linus", "Barbara", "Edsger", "Margaret"]
+    );
+}
+
+#[test]
 fn correlated_scalar_subquery() {
     assert_eq!(
         rows("SELECT name, (SELECT name FROM dept WHERE id = emp.dept_id) FROM emp WHERE id IN (1, 7) ORDER BY id"),
