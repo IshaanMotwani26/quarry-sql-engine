@@ -23,3 +23,29 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --all-targets
+
+  # Random queries in Quarry and DuckDB must agree. Quarry is queried through
+  # its Postgres server, which the psycopg check also exercises.
+  difftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install DuckDB and psycopg
+        run: pip install duckdb "psycopg[binary]"
+      - name: Build the server
+        run: cargo build --release --bin quarry-server
+      - name: Differential test against DuckDB
+        run: |
+          for seed in 1 2 3; do
+            python tests/difftest/duckdb_diff.py --rounds 20 --queries 100 --seed "$seed"
+          done
+      - name: psycopg client check
+        run: |
+          target/release/quarry-server --tpch 0.01 &
+          sleep 2
+          python tests/clients/psycopg_check.py

@@ -47,22 +47,24 @@ Reproduce with `cargo run --release --bin quarry-bench -- 0.1 1 --runs 3`. The c
 
 ### How correctness is checked
 
-247 tests, run in CI with `clippy -D warnings` and `rustfmt`:
+248 Rust tests, run in CI with `clippy -D warnings` and `rustfmt`:
 
 - **Property tests**: random syntax trees must print and reparse identically.
 - **Differential tests**: every query must return the same result with the optimizer on and off, and with hash and nested-loop joins (1,200 random queries plus all six TPC-H queries); semi and anti joins are checked against `EXISTS` on random tables.
 - **Reference implementations**: TPC-H Q1, Q3, and Q6 are recomputed directly in Rust and compared.
 - **Mutation testing**: deliberately planted bugs (wrong outer-join pushdown, NULL keys that match, a dropped join residual, and others) must each fail at least one test. This found two weak tests, which were strengthened, and one unnecessary optimizer restriction, which was removed.
 - **SQLite and DuckDB**: the benchmark fails if any answer differs from either.
+- **Differential testing against DuckDB** (`tests/difftest/duckdb_diff.py`, also run in CI): random queries over random tables full of NULLs, duplicates, and empty strings, with outer joins, correlated `EXISTS`/`IN`/scalar subqueries, `NOT IN`, grouping, `HAVING`, `DISTINCT`, and `LIMIT`, must give the same answers in both engines. It found a real bug: `NULL IN` an empty subquery returned NULL instead of FALSE, which made `NOT IN` drop rows. After the fix, about 20,000 queries agree.
 - **Parquet fixtures** written by pyarrow and DuckDB, plus thousands of randomly corrupted files that must fail with an error, never a crash.
 
 ## Quick start
 
 ```bash
-cargo test                               # 247 tests
+cargo test                               # 248 tests
 cargo run --release                      # REPL; \? lists commands, \demo loads sample tables
-cargo run --release --bin quarry-bench   # TPC-H benchmark against SQLite
+cargo run --release --bin quarry-bench   # TPC-H benchmark against SQLite and DuckDB
 cargo run --release --bin quarry-server -- --tpch 0.01   # Postgres-compatible server on port 5433
+python tests/difftest/duckdb_diff.py     # random queries vs DuckDB (pip install duckdb "psycopg[binary]")
 ```
 
 ```
@@ -216,12 +218,6 @@ Q8 gains the most: filtering `part` before its cross product with `supplier` shr
 - **CSV export** (`src/csv.rs`): the inverse of the loader, round-trip tested with quotes, delimiters, line breaks, NULLs, and empty strings.
 - **`quarry-bench`** (`src/bin/bench.rs`): generates TPC-H data, times each query in Quarry, exports the tables to an in-memory SQLite database (through the `sqlite3` tool, so Quarry stays dependency-free), runs SQLite-dialect versions of the same queries in two index setups, and compares every answer. See [Results](#results).
 
-### Phase 8a: Scale factor 1, and DuckDB
-
-- **`quarry-bench`** now also runs DuckDB (through the `duckdb` shell), with one thread and with all cores, and runs up to scale factor 1. The tables are exported to CSV once and loaded into each engine.
-- **Matching DuckDB's arithmetic**: DuckDB evaluates `0.06 - 0.01` as an exact DECIMAL, while Quarry and SQLite use floating point (see [Known limitations](#known-limitations)), so Q6's bounds are cast to DOUBLE in DuckDB's copy of the query. Without that, the engines disagree about which 5% and 7% discounts fall inside the range.
-- At scale factor 1 Quarry needs about 3.5 GB of memory: generating the data takes 5 seconds and all six queries run in about 15.
-
 ### Phase 7a: Parquet reader
 
 Reads Parquet files with `\load <table> <file.parquet>`, with no Parquet library (`src/parquet/`):
@@ -245,9 +241,22 @@ quarry=> select l_returnflag, count(*) from lineitem group by l_returnflag order
 - **Extended query protocol** (`extended.rs`): Parse, Bind, Describe, Execute, Close, and Sync, with prepared statements, `$1` parameters in text or binary format (including Postgres's base-10000 binary NUMERIC), portals that hand out rows in batches, and discarding messages after an error until the next Sync. This is what psycopg and most drivers use for every query.
 - **Transactions as clients expect them**: Quarry is read-only, but `BEGIN`, `COMMIT`, `ROLLBACK`, and `SET` are accepted and the transaction status is tracked, including the failed state after an error, because drivers check it.
 - **One thread per connection** sharing one catalog. Making that possible meant replacing the catalog's statistics cache `RefCell` with a `Mutex`.
-- **Tested** by a protocol-level client in `tests/pgwire.rs`, and against real clients: psql 16 and psycopg 3 (`tests/clients/psycopg_check.py`).
+- **Tested** by a protocol-level client in `tests/pgwire.rs`, against real clients (psql 16 and psycopg 3, in `tests/clients/psycopg_check.py`), and by the DuckDB differential tests, which send every query through psycopg.
 
 Listens on localhost only, since there is no authentication. psql's `\d` commands query Postgres's system catalogs, which Quarry doesn't have.
+
+### Phase 8a: Scale factor 1, and DuckDB
+
+- **`quarry-bench`** now also runs DuckDB (through the `duckdb` shell), with one thread and with all cores, and runs up to scale factor 1. The tables are exported to CSV once and loaded into each engine.
+- **Matching DuckDB's arithmetic**: DuckDB evaluates `0.06 - 0.01` as an exact DECIMAL, while Quarry and SQLite use floating point (see [Known limitations](#known-limitations)), so Q6's bounds are cast to DOUBLE in DuckDB's copy of the query. Without that, the engines disagree about which 5% and 7% discounts fall inside the range.
+- At scale factor 1 Quarry needs about 3.5 GB of memory: generating the data takes 5 seconds and all six queries run in about 15.
+
+### Phase 8b: Differential testing against DuckDB
+
+- **A random query generator** (`tests/difftest/duckdb_diff.py`) builds type-correct SQL from the features both engines share: inner, outer, and cross joins, derived tables, `CASE`, `COALESCE`, string functions, `BETWEEN`, `IN` lists with NULLs, `LIKE`, correlated subqueries of every kind, aggregates with `DISTINCT`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, and `OFFSET`.
+- **Each round** generates three small random tables, loads them into DuckDB and into a fresh `quarry-server`, and compares results as multisets (or in order, when the query has `ORDER BY` and `LIMIT`). Quarry is queried through psycopg, so the wire protocol is tested too.
+- **What it found**: Quarry evaluated `x IN (subquery)` as NULL whenever `x` was NULL, but SQL says the answer is FALSE when the subquery returns no rows, since there is nothing to be unsure about. So `NULL NOT IN (empty)` was NULL instead of TRUE, and correlated `NOT IN` filters silently dropped rows. Before the fix about 1.5% of random queries disagreed; after it, none do. It also turned up an internal error in DuckDB itself (a column-binding assertion on a `FULL JOIN` with a correlated subquery), which the harness reports separately.
+- **In CI**, a second job runs 6,000 random queries (three fixed seeds) and the psycopg client check on every push.
 
 ## Known limitations
 
