@@ -10,40 +10,40 @@ The optimizer pushes filters down, prunes unused columns, folds constants, turns
 
 ## Results
 
-`quarry-bench` runs TPC-H queries 1, 3, 6, 8, 13, and 22 in Quarry, SQLite 3.45, and DuckDB 1.4, all in memory, and compares every row of every answer.
+`quarry-bench` runs TPC-H queries 1, 3, 6, 8, 13, and 22 in Quarry, SQLite 3.54, and DuckDB 1.5, all in memory, and compares every row of every answer.
 
 **Correctness:** all three engines return identical results for all six queries at scale factors 0.01, 0.05, 0.1, and 1 (6 million lineitem rows), in every setup below.
 
-**Speed at scale factor 1.** Times are best of 3 on a 2-core Linux cloud VM and will vary by machine. Quarry and SQLite are single-threaded; DuckDB is shown both ways.
+**Speed at scale factor 1.** Times are best of 3 on a 12-thread Windows PC and will vary by machine. Quarry and SQLite are single-threaded; DuckDB is shown both ways.
 
-| Query | Quarry | SQLite, + foreign-key indexes | DuckDB, 1 thread | DuckDB, 2 threads |
+| Query | Quarry | SQLite, + foreign-key indexes | DuckDB, 1 thread | DuckDB, 12 threads |
 |---|---|---|---|---|
-| Q1 | 5,005 ms | 6,491 ms (Quarry 1.3× faster) | 335 ms | 174 ms |
-| Q3 | 1,986 ms | 1,054 ms (SQLite 1.9× faster) | 82 ms | 50 ms |
-| Q6 | 1,333 ms | 931 ms (SQLite 1.4× faster) | 75 ms | 40 ms |
-| Q8 | 2,275 ms | 17,832 ms (Quarry 7.8× faster) | 68 ms | 44 ms |
-| Q13 | 3,301 ms | 2,436 ms (SQLite 1.4× faster) | 166 ms | 106 ms |
-| Q22 | 1,016 ms | 82 ms (SQLite 12× faster) | 35 ms | 26 ms |
+| Q1 | 4,398 ms | 4,417 ms (even) | 185 ms | 51 ms |
+| Q3 | 1,533 ms | 694 ms (SQLite 2.2× faster) | 51 ms | 39 ms |
+| Q6 | 908 ms | 396 ms (SQLite 2.3× faster) | 28 ms | 10 ms |
+| Q8 | 2,228 ms | 2,622 ms (Quarry 1.2× faster) | 37 ms | 30 ms |
+| Q13 | 2,869 ms | 1,494 ms (SQLite 1.9× faster) | 166 ms | 122 ms |
+| Q22 | 689 ms | 61 ms (SQLite 11× faster) | 22 ms | 31 ms |
 
 **At scale factor 0.1**, SQLite also runs with primary keys only (above 0.1 that setup is skipped: its Q22 plan grows with the square of the data):
 
 | Query | Quarry | SQLite, primary keys only | SQLite, + foreign-key indexes | DuckDB, 1 thread |
 |---|---|---|---|---|
-| Q1 | 491 ms | 568 ms | 596 ms | 33 ms |
-| Q3 | 183 ms | 48 ms | 58 ms | 8 ms |
-| Q6 | 130 ms | 88 ms | 85 ms | 8 ms |
-| Q8 | 218 ms | 1,154 ms | 657 ms | 11 ms |
-| Q13 | 218 ms | 371 ms | 173 ms | 22 ms |
-| Q22 | 54 ms | 5,599 ms | 7 ms | 7 ms |
+| Q1 | 403 ms | 345 ms | 379 ms | 17 ms |
+| Q3 | 122 ms | 29 ms | 42 ms | 6 ms |
+| Q6 | 75 ms | 44 ms | 48 ms | 3 ms |
+| Q8 | 168 ms | 35 ms | 9 ms | 6 ms |
+| Q13 | 189 ms | 729 ms | 73 ms | 15 ms |
+| Q22 | 41 ms | 3,665 ms | 3 ms | 5 ms |
 
 What the numbers show:
 
-- **DuckDB is 15–33× faster than Quarry on one thread.** That gap is vectorized execution: DuckDB processes columns in batches of 2,048 values with tight loops, while Quarry interprets one row at a time and copies a tagged value for every cell. It is the clearest next step for Quarry (see [Future work](#future-work)).
-- **Quarry's optimizer beats SQLite's on plans.** Against SQLite with only primary keys, Quarry wins 4 of 6 queries at scale 0.1: it decorrelates Q22's `NOT EXISTS` into an anti join (100× faster than SQLite's nested loop) and orders Q8's eight-table join from statistics. With foreign-key indexes SQLite still picks a poor Q8 plan, and Quarry is 7.8× faster at scale 1.
-- **Indexes beat hash joins on selective lookups.** With foreign-key indexes, SQLite wins Q3, Q13, and Q22: it looks rows up in B-trees, while Quarry, which has no indexes, builds a hash table for every join. SQLite also wins Q6, a single-table scan, because its bytecode VM outruns Quarry's interpreter.
-- **Quarry wins Q1 against SQLite at every scale.** It's a scan with eight aggregates, where indexes don't help and Quarry's columnar storage reads only the 7 columns the query uses.
+- **DuckDB is 17–60× faster than Quarry on one thread.** That gap is vectorized execution: DuckDB processes columns in batches of 2,048 values with tight loops, while Quarry interprets one row at a time and copies a tagged value for every cell. It is the clearest next step for Quarry (see [Future work](#future-work)).
+- **Decorrelation and hash joins beat a missing index.** Against SQLite with only primary keys, Quarry is 89× faster on Q22, because it turns the correlated `NOT EXISTS` into an anti join while SQLite re-runs the subquery for every customer, and 3.9× faster on Q13, where SQLite has no index for the outer join and Quarry builds a hash table.
+- **Where SQLite has an index, SQLite wins.** With foreign-key indexes it looks rows up in B-trees, while Quarry, which has no indexes, builds a hash table for every join. SQLite's bytecode VM also beats Quarry's interpreter on Q6, a single-table scan.
+- **Quarry's hash joins scale more predictably.** From scale 0.1 to 1, Quarry's Q8 time grows 13× with 10× the data. SQLite's grows about 300× as its eight-table join plan changes, so at scale 1 Quarry is 1.2× faster on Q8 and even on Q1.
 
-Reproduce with `cargo run --release --bin quarry-bench -- 0.1 1 --runs 3`. The comparisons need `sqlite3` and `duckdb` on your PATH (Windows: `winget install SQLite.SQLite DuckDB.cli`); either is skipped if missing.
+Reproduce with `cargo run --release --bin quarry-bench -- 0.1 1 --runs 3`. The comparisons need `sqlite3` and `duckdb` on your PATH (Windows: `winget install SQLite.SQLite DuckDB.cli`, then open a new terminal); either is skipped if missing. DuckDB and SQLite report times to the millisecond.
 
 ### How correctness is checked
 
@@ -249,7 +249,7 @@ Listens on localhost only, since there is no authentication. psql's `\d` command
 
 - **`quarry-bench`** now also runs DuckDB (through the `duckdb` shell), with one thread and with all cores, and runs up to scale factor 1. The tables are exported to CSV once and loaded into each engine.
 - **Matching DuckDB's arithmetic**: DuckDB evaluates `0.06 - 0.01` as an exact DECIMAL, while Quarry and SQLite use floating point (see [Known limitations](#known-limitations)), so Q6's bounds are cast to DOUBLE in DuckDB's copy of the query. Without that, the engines disagree about which 5% and 7% discounts fall inside the range.
-- At scale factor 1 Quarry needs about 3.5 GB of memory: generating the data takes 5 seconds and all six queries run in about 15.
+- At scale factor 1 Quarry needs about 3.5 GB of memory: generating the data takes about 4 seconds and all six queries run in about 13.
 
 ### Phase 8b: Differential testing against DuckDB
 
@@ -262,7 +262,7 @@ Listens on localhost only, since there is no authentication. psql's `\d` command
 
 - **DECIMAL is stored as DOUBLE.** TPC-H's prices and discounts are exact decimals. In binary floating point, `0.06 + 0.01` is `0.06999…`, so Q6's `l_discount BETWEEN 0.05 AND 0.07` drops every 7% discount that a real database would keep. SQLite stores these columns as doubles too, and the benchmark makes DuckDB's literals doubles, so the engines agree, but all would differ from exact decimal answers.
 - **The optimizer's search is simple.** Join orders are left-deep and chosen greedily, not by exhaustive search, and estimates come from distinct counts, not histograms. Scalar subqueries and subqueries that aggregate still run once per outer row.
-- **Execution is row-at-a-time and single-threaded**, with a tagged value per cell, which is why DuckDB is 15–33× faster.
+- **Execution is row-at-a-time and single-threaded**, with a tagged value per cell, which is why DuckDB is 17–60× faster.
 - **Memory**: columns store an `Option` per value (16 bytes for a number, plus a heap allocation per string), so scale factor 1 takes about 3.5 GB, several times the raw data size.
 - **No indexes**, and tables live in memory only, disappearing when the REPL exits.
 - **Generated data, not official `dbgen` output**: sizes, keys, and value rules follow the TPC-H spec, but text fields are simpler, so results don't match the official answer set.
